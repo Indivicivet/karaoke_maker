@@ -453,10 +453,38 @@ def map_words_to_line_chunks(line_text: str, words: list) -> list[dict]:
     return chunks
 
 
+def has_japanese_text(text: str) -> bool:
+    """Checks if text contains Hiragana, Katakana, or CJK Kanji."""
+    return any(
+        (0x3040 <= ord(c) <= 0x309F)
+        or (0x30A0 <= ord(c) <= 0x30FF)
+        or (0x4E00 <= ord(c) <= 0x9FFF)
+        for c in text
+    )
+
+
+def detect_audio_language(model, vocals_wav: Path) -> str:
+    """Detects spoken language from vocal stem audio using Whisper."""
+    import whisper
+
+    audio = whisper.load_audio(str(vocals_wav))
+    mel = whisper.log_mel_spectrogram(audio, model.dims.n_mels)
+    mel_seg = (
+        whisper.pad_or_trim(mel, 3000)
+        .to(model.device)
+        .to(next(model.parameters()).dtype)
+    )
+    _, probs = model.detect_language(mel_seg)
+    detected = max(probs, key=probs.get)
+    print(f"  Detected audio language: {detected} (confidence: {probs[detected]:.1%})")
+    return detected
+
+
 def stage3_align(
     workspace: Path,
     lyrics_arg: Path | None,
     whisper_model: str,
+    language: str,
     manifest: dict,
     force: bool,
 ) -> bool:
@@ -479,7 +507,7 @@ def stage3_align(
         artifacts = [lyrics_txt, alignment_json]
 
     input_fp = compute_fingerprint(
-        upstream, {"stage": 3, "whisper_model": whisper_model}
+        upstream, {"stage": 3, "whisper_model": whisper_model, "language": language}
     )
     should_run, kept = check_stage_status(artifacts, input_fp, manifest, force)
     if not should_run:
@@ -511,6 +539,10 @@ def stage3_align(
         whisper_model, device=device, download_root=str(whisper_cache)
     )
 
+    resolved_lang = (
+        language.lower() if (language and language.lower() != "auto") else None
+    )
+
     if lyrics_txt.exists() and (has_user_lyrics or not force):
         raw_lines = [
             ln.strip()
@@ -519,10 +551,17 @@ def stage3_align(
         ]
         clean_lines = [strip_ruby_overrides(ln) for ln in raw_lines]
         joined_text = "\n".join(clean_lines)
+
+        if resolved_lang is None:
+            if has_japanese_text(joined_text):
+                resolved_lang = "ja"
+            else:
+                resolved_lang = detect_audio_language(model, vocals_wav)
+
         result = model.align(
             str(vocals_wav),
             joined_text,
-            language="ja",
+            language=resolved_lang,
             original_split=True,
         )
         out_lines = []
@@ -534,7 +573,10 @@ def stage3_align(
                 chunks = []
             out_lines.append({"text": clean_ln, "chunks": chunks})
     else:
-        transcribe_kwargs = {"language": "ja"}
+        if resolved_lang is None:
+            resolved_lang = detect_audio_language(model, vocals_wav)
+
+        transcribe_kwargs = {"language": resolved_lang}
         if device == "cuda" and total_vram_gb < 6.0:
             transcribe_kwargs["fp16"] = False
         result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
@@ -650,11 +692,23 @@ def generate_ruby_line(line: str, tagger: fugashi.Tagger) -> str:
             continue
         if part.startswith("{") and part.endswith("}") and "|" in part:
             out.append(part)
+        elif not any(0x4E00 <= ord(c) <= 0x9FFF for c in part):
+            out.append(part)
         else:
+            cursor = 0
             for word in tagger(part):
                 surf = word.surface
-                kana = getattr(word.feature, "kana", None) or ""
-                out.append(annotate_token_furigana(surf, kana))
+                idx = part.find(surf, cursor)
+                if idx != -1:
+                    out.append(part[cursor:idx])
+                    kana = getattr(word.feature, "kana", None) or ""
+                    out.append(annotate_token_furigana(surf, kana))
+                    cursor = idx + len(surf)
+                else:
+                    kana = getattr(word.feature, "kana", None) or ""
+                    out.append(annotate_token_furigana(surf, kana))
+            if cursor < len(part):
+                out.append(part[cursor:])
     return "".join(out)
 
 
@@ -1747,6 +1801,11 @@ def main():
         help="Whisper model name for stable-ts",
     )
     parser.add_argument(
+        "--language",
+        default="auto",
+        help="Spoken language for Whisper ('auto', 'ja', 'en', etc.). Default: auto.",
+    )
+    parser.add_argument(
         "--sep-model",
         default=DEFAULT_SEP_MODEL,
         help="audio-separator model file name",
@@ -1828,7 +1887,9 @@ def main():
     run_stage(
         3,
         "Transcribing / aligning lyrics",
-        lambda f: stage3_align(workspace, lyrics_path, args.whisper_model, manifest, f),
+        lambda f: stage3_align(
+            workspace, lyrics_path, args.whisper_model, args.language, manifest, f
+        ),
     )
 
     font_path = ensure_subtitle_font(font_arg)
