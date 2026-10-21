@@ -27,20 +27,27 @@ def run_cmd(cmd: list[str]):
 def isolate_stems(audio_file: Path, out_dir: Path) -> tuple[Path, Path]:
     print("[1/5] Isolating vocal stem via Demucs...")
     run_cmd(["demucs", "-n", "htdemucs", "-o", str(out_dir), str(audio_file)])
-    
+
     stem_dir = out_dir / "htdemucs" / audio_file.stem
     vocals = stem_dir / "vocals.wav"
     instrumental = stem_dir / "instrumental.wav"
 
     if not instrumental.exists():
-        run_cmd([
-            "ffmpeg", "-y",
-            "-i", str(stem_dir / "drums.wav"),
-            "-i", str(stem_dir / "bass.wav"),
-            "-i", str(stem_dir / "other.wav"),
-            "-filter_complex", "amix=inputs=3:normalize=0",
-            str(instrumental)
-        ])
+        run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(stem_dir / "drums.wav"),
+                "-i",
+                str(stem_dir / "bass.wav"),
+                "-i",
+                str(stem_dir / "other.wav"),
+                "-filter_complex",
+                "amix=inputs=3:normalize=0",
+                str(instrumental),
+            ]
+        )
     return vocals, instrumental
 
 
@@ -81,10 +88,33 @@ def build_guide_melody(vocals_path: Path, out_wav: Path, soundfont: Path | None)
     mid.save(str(mid_file))
 
     if soundfont and soundfont.exists():
-        run_cmd(["fluidsynth", "-ni", str(soundfont), str(mid_file), "-F", str(out_wav), "-r", "44100"])
+        run_cmd(
+            [
+                "fluidsynth",
+                "-ni",
+                str(soundfont),
+                str(mid_file),
+                "-F",
+                str(out_wav),
+                "-r",
+                "44100",
+            ]
+        )
     else:
         # Fallback silent track if no soundfont is present
-        run_cmd(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "5", str(out_wav)])
+        run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                "5",
+                str(out_wav),
+            ]
+        )
 
 
 def get_furigana_morae(text: str) -> list[tuple[str, str | None]]:
@@ -172,13 +202,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         t_s = format_ass_time(line_start)
         t_e = format_ass_time(line_end)
-        
+
         main_text = "".join(main_builder)
         ruby_text = "".join(ruby_builder)
 
         # Output both layers with precise coordinate anchors
         events.append(f"Dialogue: 1,{t_s},{t_e},RubyLine{line_num},,0,0,0,,{ruby_text}")
-        events.append(f"Dialogue: 2,{t_s},{t_e},KaraokeLine{line_num},,0,0,0,,{main_text}")
+        events.append(
+            f"Dialogue: 2,{t_s},{t_e},KaraokeLine{line_num},,0,0,0,,{main_text}"
+        )
 
     with open(out_ass, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events) + "\n")
@@ -198,7 +230,7 @@ def render_karaoke_video(
     audio_layout: str = "mix",
 ):
     print("[5/5] Multiplexing video, audio channels, and subtitle overlay...")
-    
+
     if bg_path and bg_path.exists():
         bg_input = ["-i", str(bg_path)]
     else:
@@ -209,9 +241,12 @@ def render_karaoke_video(
     # Inputs: 0 = video, 1 = instrumental, 2 = guide, 3 = vocals
     inputs = [
         *bg_input,
-        "-i", str(instrumental),
-        "-i", str(guide_wav),
-        "-i", str(vocals_wav),
+        "-i",
+        str(instrumental),
+        "-i",
+        str(guide_wav),
+        "-i",
+        str(vocals_wav),
     ]
 
     if audio_layout == "mix":
@@ -236,11 +271,16 @@ def render_karaoke_video(
             f"[0:v]ass={ass_arg}[vout]"
         )
         map_args = [
-            "-map", "[vout]",
-            "-map", "1:a",      # Audio Track 1: Off-vocal / Pure Instrumental
-            "-map", "[a_mix]",  # Audio Track 2: Guide + Vocal assistance
-            "-metadata:s:a:0", "title=Instrumental (Off-Vocal)",
-            "-metadata:s:a:1", "title=Karaoke Mix (Guide + Vocal)",
+            "-map",
+            "[vout]",
+            "-map",
+            "1:a",  # Audio Track 1: Off-vocal / Pure Instrumental
+            "-map",
+            "[a_mix]",  # Audio Track 2: Guide + Vocal assistance
+            "-metadata:s:a:0",
+            "title=Instrumental (Off-Vocal)",
+            "-metadata:s:a:1",
+            "title=Karaoke Mix (Guide + Vocal)",
         ]
 
     elif audio_layout == "split-lr":
@@ -258,12 +298,22 @@ def render_karaoke_video(
         map_args = ["-map", "[vout]", "-map", "[aout]"]
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         *inputs,
-        "-filter_complex", filter_complex,
+        "-filter_complex",
+        filter_complex,
         *map_args,
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-c:a", "aac", "-b:a", "320k",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "320k",
         "-shortest",
         str(output_mp4),
     ]
@@ -274,22 +324,46 @@ def render_karaoke_video(
 def main():
     parser = argparse.ArgumentParser(description="Japanese Karaoke Generator CLI")
     parser.add_argument("song", help="Input song file (.mp3, .flac, .wav)")
-    parser.add_argument("--lyrics", "-l", help="Path to plain text lyrics file (for forced alignment)", default=None)
-    parser.add_argument("--bg", help="Background video/image", default=None)
-    parser.add_argument("--output", "-o", default="karaoke_output.mp4", help="Output MP4 file")
     parser.add_argument(
-        "--soundfont", "-sf",
+        "--lyrics",
+        "-l",
+        help="Path to plain text lyrics file (for forced alignment)",
+        default=None,
+    )
+    parser.add_argument("--bg", help="Background video/image", default=None)
+    parser.add_argument(
+        "--output", "-o", default="karaoke_output.mp4", help="Output MP4 file"
+    )
+    parser.add_argument(
+        "--soundfont",
+        "-sf",
         default="/usr/share/sounds/sf2/default-GM.sf2",
         help="SoundFont (.sf2) path for guide melody synth",
     )
-    parser.add_argument("--guide-vol", type=float, default=0.3, 
-                    help="Volume multiplier for guide melody (0.0 to mute, 1.0 full)")
-    parser.add_argument("--vocal-vol", type=float, default=0.0, 
-                    help="Volume multiplier for original backing/lead vocal bleed (0.0 to mute, 1.0 full)")
-    parser.add_argument("--inst-vol", type=float, default=1.0, 
-                    help="Volume multiplier for instrumental backing track")
-    parser.add_argument("--audio-layout", choices=["mix", "dual-track", "split-lr"], default="mix",
-                    help="'mix' hardcodes volumes; 'dual-track' keeps stems as separate selectable tracks; 'split-lr' pans vocals to R and inst/guide to L")
+    parser.add_argument(
+        "--guide-vol",
+        type=float,
+        default=0.3,
+        help="Volume multiplier for guide melody (0.0 to mute, 1.0 full)",
+    )
+    parser.add_argument(
+        "--vocal-vol",
+        type=float,
+        default=0.0,
+        help="Volume multiplier for original backing/lead vocal bleed (0.0 to mute, 1.0 full)",
+    )
+    parser.add_argument(
+        "--inst-vol",
+        type=float,
+        default=1.0,
+        help="Volume multiplier for instrumental backing track",
+    )
+    parser.add_argument(
+        "--audio-layout",
+        choices=["mix", "dual-track", "split-lr"],
+        default="mix",
+        help="'mix' hardcodes volumes; 'dual-track' keeps stems as separate selectable tracks; 'split-lr' pans vocals to R and inst/guide to L",
+    )
     args = parser.parse_args()
 
     song_path = Path(args.song).resolve()
@@ -299,10 +373,10 @@ def main():
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
         vocals, inst = isolate_stems(song_path, tmp)
-        
+
         guide_wav = tmp / "guide.wav"
         build_guide_melody(vocals, guide_wav, Path(args.soundfont))
-        
+
         ass_path = tmp / "karaoke.ass"
         lyrics_in = Path(args.lyrics).resolve() if args.lyrics else None
         create_ass_karaoke(vocals, lyrics_in, ass_path)
