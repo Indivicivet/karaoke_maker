@@ -6,6 +6,8 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 
 ### Execution and workflow
 - Single-command execution: Running `python karaoke_maker.py "song.mp3"` with only an audio file runs end-to-end and produces a completed MP4.
+- Must run on windows.
+- Clear progress indicator including time taken so far.
 - Song workspace folder: Each run creates a dedicated output folder for the song containing the final video and all intermediate artifacts (stems, extracted MIDI, generated ASS subtitles, and lyrics).
 - Resume and manual edit capability: Stages check for existing artifacts in the workspace before computing. If an artifact exists (or was manually edited), the pipeline picks it up and continues without re-running completed steps.
 - Lyrics handling: If a lyrics file is not provided, the pipeline transcribes the vocals automatically. If a lyrics file is provided or already exists in the song folder, it is used directly and never overwritten.
