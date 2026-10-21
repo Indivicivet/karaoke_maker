@@ -257,7 +257,8 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 | `--inst-vol`, `--guide-vol`, `--vocal-vol` | see table | Stem levels. |
 | `--style` | `dam` | `dam` or `joysound` color/layout preset. |
 | `--guide-timbre` | `vibraphone` | `vibraphone` or `glockenspiel`. |
-| `--whisper-model` | `large-v3` | Whisper model name for stable-ts. |
+| `--whisper-model` | `large-v3` (or `medium` if <6GB VRAM) | Whisper model name for stable-ts. |
+| `--language` | `auto` | Spoken language code for Whisper (`auto`, `ja`, `en`, etc.). Auto-detects from vocals or lyrics. |
 | `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |
 | `--font` | `cache/fonts/` Noto Sans CJK JP Bold | Subtitle font file. |
 | `--force STAGE` | none | Regenerate this stage and everything after it, even edited artifacts (prompts for confirmation before discarding edits). |
