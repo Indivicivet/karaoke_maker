@@ -29,80 +29,230 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 
 ## System requirements and dependencies
 
-### System tools
-- FFmpeg (compiled with libass support) for audio mixing, video encoding, and burning ASS subtitles.
-- FluidSynth for synthesizing MIDI guide melodies through a SoundFont.
-- General MIDI SoundFont (`.sf2`), such as FluidR3_GM.sf2 or default-GM.sf2, containing standard melodic percussion (vibraphone or glockenspiel).
+Everything the pipeline needs beyond the prerequisites below (separation models, Whisper weights, the subtitle font, the default background) is downloaded or generated automatically on first use and cached in `%LOCALAPPDATA%\karaoke_maker\`. No SoundFont or other manually sourced asset is required.
+
+### Prerequisites
+- Python 3.11 or 3.12 (64-bit).
+- PyTorch installed from the official PyTorch index (CUDA build if an NVIDIA GPU is available; the CPU build works but separation and Whisper are much slower).
+- FFmpeg on `PATH`, built with libass (e.g. the gyan.dev Windows builds via `winget install Gyan.FFmpeg`). At startup the pipeline runs `ffmpeg -hide_banner -filters` and aborts with an install hint if the `ass` filter is missing.
 
 ### Python packages
-- `demucs`: Separates input songs into vocal and backing tracks.
-- `stable-ts`: Aligns Whisper speech-to-text models to vocal audio at word and character boundaries.
-- `basic-pitch`: Tracks pitch from the isolated vocal stem to generate MIDI notes.
-- `mido`: Builds and edits MIDI files, handles tick quantization, and writes program changes.
-- `fugashi` with `unidic-lite`: Tokenizes Japanese text and extracts readings for kanji compounds.
-- `pykakasi`: Converts readings between katakana and hiragana.
+- `audio-separator`: Vocal/instrumental separation using UVR-family models (Mel-Band RoFormer / BS-RoFormer by default; Demucs and MDX-Net models are also selectable). Models are downloaded on first use.
+- `stable-ts`: Whisper transcription (no lyrics supplied) and Whisper-based forced alignment of supplied lyrics to the vocal stem.
+- `torchcrepe`: Monophonic f0 (pitch) tracking of the vocal stem with a periodicity (voicing confidence) output.
+- `mido`: Writes and reads the editable guide melody MIDI file.
+- `fugashi` with `unidic-lite`: Tokenizes Japanese text and supplies kana readings for kanji.
+- `fonttools`: Reads glyph advance widths and OS/2 metrics from the subtitle font for layout.
+- `numpy`, `soundfile`: Audio arrays, guide chime synthesis, WAV I/O, background frame generation.
+
+> [!NOTE]
+> Technology changes from the earlier draft, and why:
+> - Demucs → `audio-separator`. The `demucs` package has not had a release since 2023 and saves audio through `torchaudio`; from torchaudio 2.9 the I/O backend moved to TorchCodec, which commonly fails to load on Windows. `audio-separator` is maintained, ships Windows wheels, gives access to RoFormer models with better vocal isolation, and still offers Demucs models if wanted.
+> - Basic Pitch → `torchcrepe`. Basic Pitch is a polyphonic note transcriber (not an f0 tracker), it declares support only for Python ≤ 3.11, and it pulls in a TensorFlow/ONNX runtime alongside PyTorch. `torchcrepe` is a PyTorch f0 tracker with Viterbi decoding, so it reuses the torch install already needed for separation and Whisper.
+> - FluidSynth + SoundFont → built-in numpy chime synthesis. FluidSynth is a separate Windows install and the SoundFont had no specified source, so a bare `python karaoke_maker.py song.mp3` could not run end-to-end. A short additive-synthesis mallet tone (vibraphone- or glockenspiel-like) is enough for a guide melody and needs no external assets. `guide.mid` is still written, so users can render it in a DAW if they want a different sound.
+> - `pykakasi` removed. Converting katakana to hiragana is a fixed Unicode offset (U+30A1–U+30F6 → U+3041–U+3096); a dependency is not needed for it.
+> - `fonttools` added. Ruby placement and the outline-inclusive wipe both need glyph advance widths, which the earlier draft required but provided no tool for.
+
+## Song workspace
+
+Default location: `<song_dir>/<song_stem>_karaoke/` (override with `--workspace`).
+
+| Artifact | Producer | Manually editable | Notes |
+|---|---|---|---|
+| `source.wav` | Stage 1 | no | Input decoded by FFmpeg to 44.1 kHz stereo float WAV. All later stages read only WAV, which avoids codec and non-ASCII-path problems in individual libraries. |
+| `vocals.wav`, `instrumental.wav` | Stage 2 | yes (replace) | |
+| `lyrics.txt` | user / Stage 3 | yes | One display line per text line. Blank lines are ignored. Optional ruby overrides `{base|reading}`. |
+| `alignment.json` | Stage 3 | yes | Start/end times (seconds) of aligned chunks, each mapped to a character range of a lyric line. |
+| `lyrics_ruby.txt` | Stage 4 | yes | `lyrics.txt` with every kanji group annotated as `{本気|ほんき}`; edit readings here (e.g. `{本気|まじ}`). |
+| `karaoke.ass` | Stage 4 | yes | |
+| `guide.mid` | Stage 5 | yes | Monophonic guide melody. |
+| `guide.wav` | Stage 5 | yes (replace) | |
+| `<song_stem>_karaoke.mp4` | Stage 7 | n/a | Final output. |
+| `manifest.json` | all stages | no | Per-artifact fingerprints (see below). |
+
+### Resume, edit detection and staleness
+`manifest.json` records, for every artifact the pipeline writes: a SHA-256 of its upstream inputs plus the stage parameters that affect it (`input_fp`), and a SHA-256 of the file as written (`output_fp`). Before running a stage:
+
+1. Artifact missing → run the stage.
+2. Artifact hash ≠ `output_fp` (the user edited or replaced it) → keep it and do not overwrite it. If its `input_fp` is also out of date, print a warning that the edited file may be stale and that deleting it will regenerate it.
+3. Artifact unchanged and `input_fp` still matches → skip the stage.
+4. Artifact unchanged but `input_fp` no longer matches (an upstream file was edited or a relevant flag changed) → regenerate it.
+
+This makes edits propagate downstream. For example, editing `lyrics.txt` triggers re-alignment, a new `lyrics_ruby.txt`, a new ASS file and a re-render, while separation is left alone. Mix-only flags (`--inst-vol` etc.) affect only Stage 7.
+
+### Lyrics source precedence
+1. `-l/--lyrics PATH` given: the file is read and never modified. If the workspace already holds a different `lyrics.txt`, that file is renamed to `lyrics.<YYYYmmdd-HHMMSS>.bak.txt` (not overwritten), and the supplied file is copied in as `lyrics.txt`.
+2. Otherwise, an existing workspace `lyrics.txt` is used as-is.
+3. Otherwise, Stage 3 transcribes the vocals and writes `lyrics.txt` (one line per Whisper segment) together with `alignment.json`, so that later edits to the text can trigger re-alignment.
 
 ## Architecture and execution stages
 
 ```
-Input song (audio) [+ optional plain text lyrics]
+Input song (any FFmpeg-readable audio) [+ optional lyrics.txt]
   │
-  ├── [Stage 1] Stem separation (Demucs)
+  ├── [Stage 1] Decode (FFmpeg) → source.wav
+  │
+  ├── [Stage 2] Stem separation (audio-separator, RoFormer vocal model)
   │     ├── vocals.wav
   │     └── instrumental.wav
   │
-  ├── [Stage 2] Guide melody synthesis (Basic Pitch + FluidSynth)
-  │     ├── Pitch tracking (f0) from vocals.wav
-  │     ├── Note cleanup (rejection under 70ms, monophonic filtering)
-  │     ├── General MIDI program 11 (Vibraphone) or 9 (Glockenspiel)
-  │     └── Output: guide.wav
+  ├── [Stage 3] Lyrics and alignment (stable-ts / Whisper, language="ja")
+  │     ├── No lyrics: transcribe vocals.wav → lyrics.txt + alignment.json
+  │     └── Lyrics:    model.align(vocals.wav, text, original_split=True) → alignment.json
   │
-  ├── [Stage 3] Syllable alignment and furigana layout (stable-ts + Fugashi)
-  │     ├── Forced alignment against lyric text (kana-mapped morae)
-  │     ├── Morphological parsing to generate furigana for kanji
-  │     ├── Mora timing distribution
-  │     └── ASS subtitle generation (dual-line layout with continuous \kf sweeps)
+  ├── [Stage 4] Furigana and subtitle layout (fugashi + fontTools)
+  │     ├── Readings for kanji groups (okurigana stripped) → lyrics_ruby.txt
+  │     ├── Mora segmentation and per-mora timing from alignment.json
+  │     ├── Glyph-advance layout of base text and ruby
+  │     └── karaoke.ass (dual-line layout, clip-based wipe)
   │
-  └── [Stage 4] Audio mixing and video rendering (FFmpeg)
-        ├── Subtitle burning with libass
-        ├── Stem volume balancing (instrumental, guide chime, vocals)
-        └── Output: 1080p MP4
+  ├── [Stage 5] Guide melody (torchcrepe + numpy synth)
+  │     ├── f0 + periodicity from vocals.wav (10 ms hop)
+  │     ├── Note segmentation (+ re-trigger at chunk onsets), drop notes < 70 ms
+  │     ├── guide.mid
+  │     └── guide.wav (synthesized mallet chime)
+  │
+  ├── [Stage 6] Background (cached default loop, or user video/image)
+  │
+  └── [Stage 7] Mix and render (FFmpeg + libass)
+        ├── Stem volume balancing per audio layout
+        ├── Subtitle burn-in via `ass` filter with `fontsdir`
+        └── Output: 1920×1080 H.264 + AAC MP4
 ```
+
+### Progress reporting
+Each stage prints a header such as `[3/7] Aligning lyrics  (total 02:14)` and a footer with that stage's duration, or `skipped (cached)`. Long-running steps show inner progress: the separator and Whisper progress bars are passed through, the background renderer reports frames, and FFmpeg is run with `-progress pipe:1`, whose `out_time_us` is converted into a percentage of the song length. A final summary lists the time for each stage and the total.
+
+### Stage 2: separation
+- Default model: a Mel-Band RoFormer vocal model from `audio-separator`'s model list (set with `--sep-model`). The instrumental stem is the model's complementary output.
+- Use CUDA when `torch.cuda.is_available()`, otherwise CPU.
+- Gotcha: the output file names are chosen by `audio-separator`. Rename them to `vocals.wav` / `instrumental.wav` based on the stem label in the returned file name, not on list order.
+
+### Stage 3: alignment
+- Whisper model `--whisper-model`, default `large-v3`. A warning is printed on CPU because it will be slow.
+- Input is `vocals.wav`, not the full mix.
+- Whisper splits Japanese into tokens and has no spaces to work with, so the "words" that stable-ts returns are token chunks of one or more characters, and a byte-level BPE token can split a kanji. Stage 3 stores these chunks unchanged, after mapping each one onto a character range of the lyric line by walking both strings in order. Dividing a chunk's time among its characters needs the readings, so that is done in Stage 4. This keeps Stage 3 independent of `lyrics_ruby.txt` edits.
+- `alignment.json` schema: `{"lines": [{"text": str, "chunks": [{"first": int, "last": int, "start": float, "end": float}]}]}`. `first` and `last` are inclusive character indices into `text`.
+
+### Stage 4: furigana and ASS layout
+
+Readings:
+- Parse each line with fugashi/UniDic and take `feature.kana` (the orthographic reading). Do not use `pron`, which writes long vowels as `ー`.
+- Remove okurigana by matching the kana at the start and end of the surface form against the reading (e.g. `食べる`/`タベル` → `{食|た}べる`), then convert the reading to hiragana. For compounds that cannot be split per character, annotate the whole kanji run as a single group (`{今日|きょう}`).
+- `{base|reading}` overrides already present in `lyrics.txt` take precedence. Song lyrics often use non-dictionary readings, so the generated `lyrics_ruby.txt` is the place where users correct them.
+- Mora counting: small ゃゅょぁぃぅぇぉゎ merge with the preceding kana; っ, ん and ー each count as one mora.
+
+Timing:
+- Character times: a chunk from `alignment.json` that covers several characters has its span divided among them in proportion to their mora counts (taken from the readings above, where a kanji group's morae are shared evenly among its characters). Characters that are not sung (punctuation, spaces) get zero duration.
+- A ruby group spans from the start of its first base character to the end of its last. That span is divided equally among the group's ruby morae, unless the base characters carry separate alignment times and the reading can be split per character, in which case each character's own span is used.
+
+Layout (all coordinates use `PlayResX=1920`, `PlayResY=1080`, `ScaledBorderAndShadow: yes`, `WrapStyle: 2`, and `\an7\pos(x,y)` on every event so positions are absolute):
+- Font: Noto Sans CJK JP Bold (static OTF), downloaded once from the `notofonts/noto-cjk` repository into the cache, or `--font PATH`. It is passed to libass with `fontsdir`, so rendering does not depend on which fonts are installed on Windows. A static font is used deliberately: variable fonts can render at their default weight in libass.
+- Widths come from fontTools `hmtx` advances. Gotcha: libass, like VSFilter, scales the font so that `usWinAscent + usWinDescent` equals the ASS font size, not the em size. Pixel width is therefore `advance * fs / (winAscent + winDescent)`. Kerning is turned off (`Kerning: no` in `[Script Info]`) to match the per-glyph sum.
+- Ruby font size is about 0.5× the base size. Each ruby group is centered over the x-extent of its base characters and placed above the base line with its own `\pos` event.
+- A line wider than the safe area (1920 − 2×margin) is scaled down horizontally with `\fscx`, and the layout widths are scaled by the same factor.
+
+Dual-line arcade layout:
+- Two slots: upper line left-aligned, lower line right-aligned. Lines alternate between the slots.
+- A line appears in its slot in the inactive (unsung) colors as soon as the slot is free: when the line two places earlier has finished plus 0.3 s, or 3 s before its first character for the opening line. It is cleared 0.5 s after its last character, or earlier if the slot is needed.
+- When the gap between lines is longer than a threshold (default 8 s, e.g. an instrumental break), both slots are cleared and the next pair appears up to 3 s before it is sung.
+
+Wipe (body and outline):
+- `\kf` cannot be used. It sweeps only the fill (Secondary → Primary); the outline keeps `OutlineColour` the whole time, which does not meet the "body and outline" requirement.
+- Each line or ruby group is instead drawn twice:
+  - Base layer (layer 0): the unsung style (fill, outline and shadow colors), shown for the line's full display time.
+  - Sung layer (layer 1): the sung style with different fill and outline colors. It is emitted as one event per timed segment (per character for base text, per mora for ruby). Each event covers only the x-range `[x_k, x_{k+1}]` of its segment and grows its clip with `\clip(x_k,y0,x_k,y1)\t(t_k,t_{k+1},\clip(x_k,y0,x_{k+1},y1))`. The clip rectangles of different segments do not overlap, so there is no double-drawn alpha, and every event holds a single `\t`, which avoids relying on how chained `\t(\clip)` tags behave.
+  - Gotcha: `y0`/`y1` and the first and last `x` must be widened by `\bord` + `\shad` (scaled) so that outline pixels outside the advance box are not clipped.
+- `--style dam|joysound` chooses the color/outline presets. The preset colors approximate the look of each brand rather than reproducing exact arcade palettes, and can be overridden in the generated ASS styles.
+
+### Stage 5: guide melody
+- Load `vocals.wav` with `soundfile`, downmix to mono and resample to 16 kHz before passing the tensor to `torchcrepe.predict`. Do not use `torchcrepe.load.audio`, so that torchaudio I/O is never involved.
+- Call `torchcrepe.predict(..., fmin=65, fmax=1100, model="full" on CUDA else "tiny", decoder=viterbi, return_periodicity=True)` with a 10 ms hop (check the keyword name against the installed version).
+- Treat a frame as voiced when periodicity > 0.5 and the frame RMS is above a gate set relative to the stem's peak RMS. Apply a median filter of about 50 ms to the MIDI-float pitch.
+- Segment notes: start a new note when the rounded pitch changes and the change lasts ≥ 50 ms (this stops vibrato from splitting notes), and also at every chunk onset from `alignment.json`, so repeated syllables on the same pitch re-trigger as DAM guide melodies do. Each note's pitch is the median of its frames. Drop notes shorter than 70 ms. The output is monophonic by construction.
+- Write `guide.mid` with mido (0-based General MIDI program 11 Vibraphone or 9 Glockenspiel, matching `--guide-timbre`, for DAW users).
+- Synthesize `guide.wav` from `guide.mid` (so that MIDI edits are honored) as an additive mallet tone: partials at about 1×, 4×, 10× the fundamental for vibraphone-like, or a brighter set for glockenspiel-like (`--guide-timbre`), with exponential decay, a 5 ms attack and release, and peak-normalized to −1 dBFS, at the length of `source.wav`.
+
+### Stage 6: background
+- No `--bg`: use `%LOCALAPPDATA%\karaoke_maker\bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
+  - Seamless loop: each particle's x and y are periodic in t with a period of exactly 10 s (integer numbers of wrap-around traversals and sinusoidal drift with integer cycle counts), and the brightness twinkle is also 10 s-periodic, so frame 300 is identical to frame 0.
+- Video `--bg`: read with `-stream_loop -1`.
+- Image `--bg` (chosen by extension: `.png .jpg .jpeg .webp .bmp`): read with `-loop 1 -framerate 30`.
+- All backgrounds pass through `scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30`, and the output length is fixed with `-t <song duration>` taken from `source.wav`. `-shortest` is not used because it is unreliable with looped inputs and filtergraphs.
 
 ## Subtitle generation details (ASS)
 
 - Subtitle format: Advanced SubStation Alpha (.ass v4.00+).
-- Fill tag: Progressive fill is implemented using `\kf<duration_cs>` overrides across primary and secondary fill styles.
-- Ruby positioning: ASS lacks a native ruby tag. Whitespace padding drifts on proportional fonts; production generation requires calculating bounding-box widths per kanji group (e.g. via font metrics) and placing furigana using absolute `\pos(x, y)` coordinates, or compiling through an Aegisub-compatible template pass.
+- Fill: clip-based two-layer wipe as described in Stage 4. `\kf` is not used because it does not wipe the outline.
+- Ruby positioning: absolute `\pos(x, y)` per ruby group from fontTools glyph metrics, using the libass font-size convention above. Whitespace padding is not used because it drifts with proportional fonts.
 
 ## Audio mixing implementation
 
+Inputs to Stage 7: `[1]` instrumental, `[2]` guide, `[3]` vocals (input `[0]` is the background). Each stem is first scaled by its parsed linear gain with `volume=<g>`.
+
 ### FFmpeg layouts
-- Master mix (`--audio-layout mix`): Merges stems into one stereo stream via `amix=inputs=3:normalize=0`. Disabling normalization preserves absolute input volume multipliers.
-- Dual-track (`--audio-layout dual-track`): Muxes stream 0 as clean instrumental (`1:a`) and stream 1 as the guide/vocal blend (`[a_mix]`).
-- Left/right split (`--audio-layout split-lr`): Pans instrumental and guide chime to channel 0 (left) and vocal guide to channel 1 (right) via `join=inputs=2:channel_layout=stereo`.
+- Master mix (`--audio-layout mix`, default): `amix=inputs=3:normalize=0`. Disabling normalization keeps the absolute gain multipliers. This is followed by `alimiter=limit=0.97`, because the unnormalized sum can go over full scale.
+- Dual-track (`--audio-layout dual-track`):
+  - Stream 0, "Off vocal": the instrumental alone at `--inst-vol`.
+  - Stream 1, "Guide": instrumental + guide + vocals, mixed as above.
+  - Both streams are tagged with `-metadata:s:a:N title=...` and stream 0 is marked `-disposition:a:0 default`. Many players, and web uploads, only play the default stream.
+- Left/right split (`--audio-layout split-lr`):
+  - Left = mono(instrumental + guide); right = mono(vocals). Each side is downmixed with `pan=mono|c0=0.5*c0+0.5*c1` and the two are combined with `join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR`, then limited.
+  - In this layout `--vocal-vol` defaults to `1.0` instead of `0.0`, because the right channel is meant to carry the vocal for the hardware balance knob. An explicit flag still wins.
 
 ### Volume parsing
 Input strings convert to linear amplitude multipliers before building FFmpeg filtergraphs:
-- Ratios (`1.0`, `0.3`): Used directly.
-- Percentages (`30%`): `val / 100`.
-- Decibels (`-10dB`, `-10`): `10 ** (dB / 20)`. Zero volume (mute) maps to amplitude `0.0`.
+- Ends in `dB` (case-insensitive, sign optional, e.g. `-6dB`, `+3dB`, `0dB`): `10 ** (dB / 20)`.
+- Ends in `%`: `val / 100`.
+- Bare negative number (`-10`): treated as dB.
+- Bare non-negative number (`1.0`, `0.3`, `0`): ratio, used directly. `0` therefore mutes, while `0dB` is unity gain.
+- `mute` or `-infdB`: `0.0`.
+- Anything else, or a negative ratio/percentage, is an argparse error. Gains above 1.0 are allowed (the limiter stops clipping) and print a warning.
 
 | Option | Flag | Default |
 |---|---|---|
 | Instrumental level | `--inst-vol` | `1.0` |
 | Guide chime level | `--guide-vol` | `0.3` |
-| Vocal guide level | `--vocal-vol` | `0.0` |
+| Vocal guide level | `--vocal-vol` | `0.0` (`1.0` with `split-lr`) |
+
+### Encoding
+`libx264 -crf 18 -preset medium -pix_fmt yuv420p -r 30`, `aac -b:a 192k`, `-movflags +faststart`.
+
+### Windows gotchas
+- The path inside the `ass=` filter argument must be escaped at the filter level. Convert `\` to `/`, escape `:` as `\:` and `'` as `\'`, then wrap the result in single quotes (`ass='C\:/songs/曲/karaoke.ass':fontsdir='C\:/Users/...'`). Pass arguments as a list to `subprocess.run` (no shell) so that non-ASCII paths are passed through unchanged.
+- Run separation and Whisper inside `if __name__ == "__main__":` because Windows starts worker processes by spawning them.
 
 ## Command-line interface
 
 ```bash
 # Minimal run (auto-transcribes lyrics, creates song workspace, outputs MP4)
-python make_karaoke.py "song.mp3"
+python karaoke_maker.py "song.mp3"
 
 # Practice video with quiet vocal assist using percentage and decibel values
-python make_karaoke.py "song.mp3" -l "lyrics.txt" --guide-vol 40% --vocal-vol -14dB
+python karaoke_maker.py "song.mp3" -l "lyrics.txt" --guide-vol 40% --vocal-vol -14dB
 
 # Custom video background with dual selectable audio tracks
-python make_karaoke.py "song.mp3" --bg "background.mp4" --audio-layout dual-track
+python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-track
 ```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `input` (positional) | — | Song audio file. |
+| `-l/--lyrics` | none | Lyrics text file (see precedence rules). |
+| `--workspace` | `<song_dir>/<stem>_karaoke` | Song workspace folder. |
+| `--bg` | cached default loop | Background video or image. |
+| `--audio-layout` | `mix` | `mix`, `dual-track` or `split-lr`. |
+| `--inst-vol`, `--guide-vol`, `--vocal-vol` | see table | Stem levels. |
+| `--style` | `dam` | `dam` or `joysound` color/layout preset. |
+| `--guide-timbre` | `vibraphone` | `vibraphone` or `glockenspiel`. |
+| `--whisper-model` | `large-v3` | Whisper model name for stable-ts. |
+| `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |
+| `--font` | cached Noto Sans CJK JP Bold | Subtitle font file. |
+| `--force STAGE` | none | Regenerate this stage and everything after it, even edited artifacts (prompts for confirmation before discarding edits). |
+
+## Verification checklist
+- Volume parser unit tests covering every form in the table, including `0` vs `0dB`.
+- Ruby splitter unit tests: `食べる`, `今日`, `お願い`, `繰り返す`, kana-only lines, `{base|reading}` overrides.
+- Metric calibration: render a single test line with the `ass` filter, measure the drawn bounding box from the frame, and check it against the fontTools prediction (within ±2 px).
+- Loop check: decode frames 0 and 299 of the default background and confirm the step between them is no larger than between neighboring frames.
+- End-to-end smoke test on a short (~30 s) clip: `python karaoke_maker.py clip.mp3` with no other flags produces an MP4 with no manual steps. Re-running skips every stage. Editing `lyrics_ruby.txt` re-runs only Stage 4 and Stage 7.
