@@ -1,31 +1,85 @@
-Japanese Karaoke Video Generator Pipeline Specification
-A modular, single-command Python pipeline to transform an arbitrary input song into a Japanese arcade-style (DAM / JOYSOUND) karaoke MP4.1. System Requirements & External DependenciesCLI Tools & System PackagesFFmpeg: Video compositing, audio mixing/filtering, and ASS subtitle burning (libass enabled).FluidSynth: SoundFont-based MIDI synthesizer for rendering the guide chime audio.General MIDI SoundFont: Standard .sf2 patch set containing standard melodic percussion (e.g., FluidR3_GM.sf2 or default-GM.sf2).Python Dependenciesdemucs: AI source separation (extracts pristine vocal and instrumental stems).stable-ts: Acoustic forced-alignment via Whisper models down to word and mora millisecond boundaries.basic-pitch: Spotify's neural network for monophonic fundamental frequency ($f_0$) pitch tracking to MIDI.mido: MIDI file generation, event sorting, tick quantization, and delta-time parsing.fugashi + unidic-lite: Morphological analysis for Kanji segmentation and accurate reading extraction.pykakasi: Kana-to-Hira conversion and mora splitting.2. Architecture & Execution StagesInput Song (Audio) [+ Optional Plaintext Lyrics]
+# Japanese karaoke video generator specification
+
+A Python command-line pipeline that turns a music file into an arcade-style (DAM or JOYSOUND) karaoke MP4 video with synced lyrics, furigana (ruby text), and an optional guide melody chime.
+
+## System requirements and dependencies
+
+### System tools
+- FFmpeg (compiled with libass support) for audio mixing, video encoding, and burning ASS subtitles.
+- FluidSynth for synthesizing MIDI guide melodies through a SoundFont.
+- General MIDI SoundFont (`.sf2`), such as FluidR3_GM.sf2 or default-GM.sf2, containing standard melodic percussion (vibraphone or glockenspiel).
+
+### Python packages
+- `demucs`: Separates input songs into vocal and backing tracks.
+- `stable-ts`: Aligns Whisper speech-to-text models to vocal audio at word and character boundaries.
+- `basic-pitch`: Tracks pitch from the isolated vocal stem to generate MIDI notes.
+- `mido`: Builds and edits MIDI files, handles tick quantization, and writes program changes.
+- `fugashi` with `unidic-lite`: Tokenizes Japanese text and extracts readings for kanji compounds.
+- `pykakasi`: Converts readings between katakana and hiragana.
+
+## Architecture and execution stages
+
+```
+Input song (audio) [+ optional plain text lyrics]
   │
-  ├── [Stage 1] AI Stem Separation (Demucs)
+  ├── [Stage 1] Stem separation (Demucs)
   │     ├── vocals.wav
   │     └── instrumental.wav
   │
-  ├── [Stage 2] AI Guide Melody Extraction (Basic Pitch + FluidSynth)
-  │     ├── Monophonic pitch tracking ($f_0$)
-  │     ├── Noise/breath cutoff (< 70ms rejection) & quantization
-  │     ├── General MIDI Patch 11 (Vibraphone / Glockenspiel)
+  ├── [Stage 2] Guide melody synthesis (Basic Pitch + FluidSynth)
+  │     ├── Pitch tracking (f0) from vocals.wav
+  │     ├── Note cleanup (rejection under 70ms, monophonic filtering)
+  │     ├── General MIDI program 11 (Vibraphone) or 9 (Glockenspiel)
   │     └── Output: guide.wav
   │
-  ├── [Stage 3] Syllable Alignment & Furigana Layout (stable-ts + Fugashi)
-  │     ├── Acoustic forced alignment to lyrics text
-  │     ├── Morphological parse: Kanji compound -> Furigana reading
-  │     ├── Sub-syllabic mora timing allocation
-  │     └── ASS Generation: Dual-line layout with continuous \kf color fill
+  ├── [Stage 3] Syllable alignment and furigana layout (stable-ts + Fugashi)
+  │     ├── Forced alignment against lyric text
+  │     ├── Morphological parsing to generate furigana for kanji
+  │     ├── Mora timing distribution
+  │     └── ASS subtitle generation (dual-line layout with continuous \kf sweeps)
   │
-  └── [Stage 4] Audio Balancing & Subtitle Burning (FFmpeg)
-        ├── Subtitle burning via ass filter
-        ├── Independent gain controls (instrumental, guide, vocal stems)
-        └── Output: Final 1080p MP4
-3. Subtitle Engine Specification (ASS)Styling RulesFormat: Advanced SubStation Alpha (.ass v4.00+).Color Sweep: Continuous horizontal fill wipe across both text fill and outline using the \kf<duration_cs> override tag.Dual-Line Logic:Even lines render to the active position.Odd lines render to the alternate line position in advance as a reading preview, mirroring JOYSOUND / DAM display systems.Furigana / Ruby Centering:Furigana text is rendered above corresponding kanji compounds at roughly 45–50% main font size.Co-timed so that the \kf duration of the kanji compound matches the sum of the swept morae in the furigana row above it.4. Audio Control & Mixing MatrixThe generator supports independent gain controls for all three audio stems prior to final multiplexing:FlagParameterDefaultFunction--inst-volFloat1.0Background music / off-vocal backing level--guide-volFloat0.3Synth bell guide melody level (0.0 mutes entirely)--vocal-volFloat0.0Original vocal bleed level (0.0 for pure karaoke, > 0.0 for vocal assist)Supported Output Audio ConfigurationsMaster Stereo Mix (--audio-layout mix): Single stereo stream blending instrumental, guide melody, and attenuated vocals using FFmpeg's amix filter.Dual-Track Stream (--audio-layout dual-track): Container holds two selectable stereo tracks (Track 1 = pure instrumental off-vocal; Track 2 = karaoke mix with guide and vocal cues).Hardware L/R Split (--audio-layout split-lr): Traditional hardware karaoke panning (Left channel = Instrumental + Guide chime; Right channel = Original Vocals) for physical mixer balancing.5. Command-Line Interface SpecificationBash# Standard pure karaoke video (Instrumental + 30% Guide Chime)
+  └── [Stage 4] Audio mixing and video rendering (FFmpeg)
+        ├── Subtitle burning with libass
+        ├── Stem volume balancing (instrumental, guide chime, vocals)
+        └── Output: 1080p MP4
+```
+
+## Subtitle engine (ASS)
+
+### Styling rules
+- Format: Advanced SubStation Alpha (.ass v4.00+).
+- Fill animation: Smooth progressive color fill using `\kf<duration_cs>` tags across text and outlines.
+- Two-line alternation: Line 1 sits on top (or row A) and line 2 sits on the bottom (or row B). While line 1 is active, line 2 shows upcoming lyrics in advance in inactive grey or white, matching arcade displays. When line 1 finishes, line 3 replaces it before its cue starts.
+- Furigana layout: Furigana text sits directly above the associated kanji at roughly 45% to 50% of the main font size. The duration of the kanji wipe matches the total duration of the furigana morae above it. Note: ASS has no native ruby layout tag. Aligning furigana with whitespace padding fails on proportional fonts because kanji and spaces have different character widths. Production implementations need pixel-width measurements per segment or coordinate-anchored `\pos` tags.
+
+## Audio mixing and stem balancing
+
+The pipeline balances three audio streams before muxing:
+- Instrumental backing track
+- Guide chime melody (synthesized bells)
+- Original vocal bleed (optional, useful for practice tracks)
+
+### Mixing options
+- Master stereo mix (`--audio-layout mix`): Blends instrumental, guide chime, and vocals into a single stereo track. When using FFmpeg's `amix` filter, `normalize=0` should be set to prevent automatic volume drops when inputs are combined.
+- Dual-track container (`--audio-layout dual-track`): Saves two selectable audio streams into the MP4 container. Track 1 is the clean off-vocal backing, and track 2 is the karaoke mix with guide chime and vocal hints.
+- Left/right split (`--audio-layout split-lr`): Classic karaoke hardware split. The left channel carries backing music and the guide chime, while the right channel carries the vocal guide, allowing physical mixers to dial in vocals via pan pots.
+
+### Volume options
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--inst-vol` | float | 1.0 | Instrumental volume multiplier |
+| `--guide-vol` | float | 0.3 | Guide melody chime volume (0.0 mutes) |
+| `--vocal-vol` | float | 0.0 | Vocal bleed volume (0.0 for clean karaoke, > 0.0 for vocal assist) |
+
+## Command-line interface
+
+```bash
+# Standard karaoke video (instrumental + 30% guide chime)
 python make_karaoke.py "song.mp3" -l "lyrics.txt" -o "karaoke.mp4"
 
-# Practice mode with low backing vocal assist
+# Practice video with quiet vocal assist
 python make_karaoke.py "song.mp3" -l "lyrics.txt" --guide-vol 0.4 --vocal-vol 0.2 -o "practice.mp4"
 
 # Custom video background with dual selectable audio tracks
-python make_karaoke.py "song.mp3" --bg "background.mp4" --audio-layout dual-track -o "kar
+python make_karaoke.py "song.mp3" --bg "background.mp4" --audio-layout dual-track -o "karaoke_dual.mp4"
+```
