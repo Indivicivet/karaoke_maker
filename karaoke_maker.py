@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import gc
 import hashlib
 import json
 import math
@@ -320,6 +321,10 @@ def stage2_separate(
     )
     sep.load_model(model_filename=sep_model)
     out_files = sep.separate(str(source_wav))
+    del sep
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     found_vocals = None
     found_inst = None
@@ -470,16 +475,35 @@ def stage3_align(
         return False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_vram_gb < 6.0 and whisper_model.startswith("large"):
+            print(
+                f"  [warning] Whisper model '{whisper_model}' requires >6GB VRAM, but GPU 0 only has {total_vram_gb:.1f}GB. "
+                "Falling back to CPU for Whisper."
+            )
+            device = "cpu"
+
     if device == "cpu":
         print(
             f"  [warning] Running Whisper '{whisper_model}' on CPU; this will be slow."
         )
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     whisper_cache = CACHE_DIR / "models" / "whisper"
     whisper_cache.mkdir(parents=True, exist_ok=True)
-    model = stable_whisper.load_model(
-        whisper_model, device=device, download_root=str(whisper_cache)
-    )
+    if device == "cuda":
+        model = stable_whisper.load_model(
+            whisper_model, device="cpu", download_root=str(whisper_cache)
+        )
+        model = model.half().to("cuda")
+    else:
+        model = stable_whisper.load_model(
+            whisper_model, device="cpu", download_root=str(whisper_cache)
+        )
 
     if lyrics_txt.exists() and (has_user_lyrics or not force):
         raw_lines = [
@@ -521,6 +545,11 @@ def stage3_align(
         json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     record_artifacts(artifacts, kept, input_fp, manifest, workspace)
     return True
 
@@ -1222,6 +1251,10 @@ def stage5_guide(
         crepe_model = "full" if device == "cuda" else "tiny"
         audio_tensor = torch.from_numpy(mono_16k).unsqueeze(0)
 
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         f0, pd = torchcrepe.predict(
             audio_tensor,
             sample_rate=target_sr,
@@ -1236,6 +1269,10 @@ def stage5_guide(
         )
         f0_np = f0.squeeze(0).cpu().numpy()
         pd_np = pd.squeeze(0).cpu().numpy()
+        del audio_tensor, f0, pd
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         n_frames = len(f0_np)
 
         rms = np.zeros(n_frames, dtype=np.float32)
@@ -1689,9 +1726,15 @@ def main():
         default="vibraphone",
         help="Guide melody synthesis timbre",
     )
+    default_whisper = "large-v3"
+    if torch.cuda.is_available():
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_vram_gb < 6.0:
+            default_whisper = "medium"
+
     parser.add_argument(
         "--whisper-model",
-        default="large-v3",
+        default=default_whisper,
         help="Whisper model name for stable-ts",
     )
     parser.add_argument(
