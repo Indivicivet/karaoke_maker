@@ -968,15 +968,15 @@ def stage4_ass(
         sung_out = "&H000028B8"
         shad_col = "&H80000000"
 
-    base_fs = 68.0
-    ruby_fs = 34.0
-    base_bord = 4.0
-    ruby_bord = 2.5
-    shad = 2.0
-    margin_x = 120.0
+    base_fs = 92.0
+    ruby_fs = 42.0
+    base_bord = 5.5
+    ruby_bord = 3.0
+    shad = 3.0
+    margin_x = 100.0
     safe_width = 1920.0 - 2.0 * margin_x
-    slot_y = (780.0, 910.0)
-    ruby_gap = 6.0
+    slot_y = (430.0, 610.0)
+    ruby_gap = 8.0
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -1077,7 +1077,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         fscx_tag = f"\\fscx{fscx_pct}" if fscx_pct != 100 else ""
         total_w = unscaled_w * scale_x
 
-        line_x = margin_x if slot == 0 else (1920.0 - margin_x - total_w)
+        line_x = (1920.0 - total_w) * 0.5
         line_y = slot_y[slot]
 
         char_x = []
