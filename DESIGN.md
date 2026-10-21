@@ -29,7 +29,19 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 
 ## System requirements and dependencies
 
-Everything the pipeline needs beyond the prerequisites below (separation models, Whisper weights, the subtitle font, the default background) is downloaded or generated automatically on first use and cached in `%LOCALAPPDATA%\karaoke_maker\`. No SoundFont or other manually sourced asset is required.
+Everything the pipeline needs beyond the prerequisites below (separation models, Whisper weights, the subtitle font, the default background) is downloaded or generated automatically on first use and cached in `<repo>/cache/`. No SoundFont or other manually sourced asset is required.
+
+### Repo-local writes only
+The pipeline writes only inside the repo folder (`<repo>` = the directory containing `karaoke_maker.py`). Input songs, lyrics files and backgrounds are read and never modified. Several libraries cache to the user profile by default, so every cache location is redirected:
+
+| Cache | Redirect |
+|---|---|
+| Default background, subtitle font | `cache/bg/`, `cache/fonts/` (our own paths) |
+| `audio-separator` models | `Separator(model_file_dir="cache/models/separator")` |
+| Whisper weights | `stable_whisper.load_model(..., download_root="cache/models/whisper")` |
+| Any other torch / Hugging Face downloads | Set `TORCH_HOME=cache/torch` and `HF_HOME=cache/hf` in `os.environ` at startup, before importing torch or the libraries that use it |
+
+Gotcha: the environment variables have to be set before the first `import torch`, because some libraries read them when they are imported. `cache/` and `songs/` are listed in `.gitignore`.
 
 ### Prerequisites
 - Python 3.11 or 3.12 (64-bit).
@@ -55,7 +67,7 @@ Everything the pipeline needs beyond the prerequisites below (separation models,
 
 ## Song workspace
 
-Default location: `<song_dir>/<song_stem>_karaoke/` (override with `--workspace`).
+Default location: `<repo>/songs/<song_stem>_karaoke/` (override with `--workspace`, which must resolve to a path inside the repo).
 
 | Artifact | Producer | Manually editable | Notes |
 |---|---|---|---|
@@ -147,7 +159,7 @@ Timing:
 - A ruby group spans from the start of its first base character to the end of its last. That span is divided equally among the group's ruby morae, unless the base characters carry separate alignment times and the reading can be split per character, in which case each character's own span is used.
 
 Layout (all coordinates use `PlayResX=1920`, `PlayResY=1080`, `ScaledBorderAndShadow: yes`, `WrapStyle: 2`, and `\an7\pos(x,y)` on every event so positions are absolute):
-- Font: Noto Sans CJK JP Bold (static OTF), downloaded once from the `notofonts/noto-cjk` repository into the cache, or `--font PATH`. It is passed to libass with `fontsdir`, so rendering does not depend on which fonts are installed on Windows. A static font is used deliberately: variable fonts can render at their default weight in libass.
+- Font: Noto Sans CJK JP Bold (static OTF), downloaded once from the `notofonts/noto-cjk` repository into `cache/fonts/`, or `--font PATH`. It is passed to libass with `fontsdir`, so rendering does not depend on which fonts are installed on Windows. A static font is used deliberately: variable fonts can render at their default weight in libass.
 - Widths come from fontTools `hmtx` advances. Gotcha: libass, like VSFilter, scales the font so that `usWinAscent + usWinDescent` equals the ASS font size, not the em size. Pixel width is therefore `advance * fs / (winAscent + winDescent)`. Kerning is turned off (`Kerning: no` in `[Script Info]`) to match the per-glyph sum.
 - Ruby font size is about 0.5× the base size. Each ruby group is centered over the x-extent of its base characters and placed above the base line with its own `\pos` event.
 - A line wider than the safe area (1920 − 2×margin) is scaled down horizontally with `\fscx`, and the layout widths are scaled by the same factor.
@@ -174,7 +186,7 @@ Wipe (body and outline):
 - Synthesize `guide.wav` from `guide.mid` (so that MIDI edits are honored) as an additive mallet tone: partials at about 1×, 4×, 10× the fundamental for vibraphone-like, or a brighter set for glockenspiel-like (`--guide-timbre`), with exponential decay, a 5 ms attack and release, and peak-normalized to −1 dBFS, at the length of `source.wav`.
 
 ### Stage 6: background
-- No `--bg`: use `%LOCALAPPDATA%\karaoke_maker\bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
+- No `--bg`: use `cache/bg/bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
   - Seamless loop: each particle's x and y are periodic in t with a period of exactly 10 s (integer numbers of wrap-around traversals and sinusoidal drift with integer cycle counts), and the brightness twinkle is also 10 s-periodic, so frame 300 is identical to frame 0.
 - Video `--bg`: read with `-stream_loop -1`.
 - Image `--bg` (chosen by extension: `.png .jpg .jpeg .webp .bmp`): read with `-loop 1 -framerate 30`.
@@ -239,7 +251,7 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 |---|---|---|
 | `input` (positional) | — | Song audio file. |
 | `-l/--lyrics` | none | Lyrics text file (see precedence rules). |
-| `--workspace` | `<song_dir>/<stem>_karaoke` | Song workspace folder. |
+| `--workspace` | `songs/<stem>_karaoke` | Song workspace folder (inside the repo). |
 | `--bg` | cached default loop | Background video or image. |
 | `--audio-layout` | `mix` | `mix`, `dual-track` or `split-lr`. |
 | `--inst-vol`, `--guide-vol`, `--vocal-vol` | see table | Stem levels. |
@@ -247,7 +259,7 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 | `--guide-timbre` | `vibraphone` | `vibraphone` or `glockenspiel`. |
 | `--whisper-model` | `large-v3` | Whisper model name for stable-ts. |
 | `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |
-| `--font` | cached Noto Sans CJK JP Bold | Subtitle font file. |
+| `--font` | `cache/fonts/` Noto Sans CJK JP Bold | Subtitle font file. |
 | `--force STAGE` | none | Regenerate this stage and everything after it, even edited artifacts (prompts for confirmation before discarding edits). |
 
 ## Verification checklist
