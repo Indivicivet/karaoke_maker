@@ -44,8 +44,8 @@ The pipeline writes only inside the repo folder (`<repo>` = the directory contai
 Gotcha: the environment variables have to be set before the first `import torch`, because some libraries read them when they are imported. `cache/` and `songs/` are listed in `.gitignore`.
 
 ### Prerequisites
-- Python 3.11 or 3.12 (64-bit).
-- PyTorch installed from the official PyTorch index (CUDA build if an NVIDIA GPU is available; the CPU build works but separation and Whisper are much slower).
+- Python 3.11+ (64-bit). On 3.14 there is no prebuilt Windows wheel for `diffq-fixed` (an `audio-separator` dependency), so it has to be compiled with Visual Studio Build Tools. `audio-separator` also excludes 3.14.1 specifically.
+- PyTorch `torch==2.11.0` + `torchaudio==2.11.0`, both from the official PyTorch index (CUDA build if an NVIDIA GPU is available; the CPU build works but separation and Whisper are much slower). The pin exists because torchaudio's newest release is 2.11 while torch is newer, and `stable-ts` and `torchcrepe` both require torchaudio, so the two must be installed as a matching pair.
 - FFmpeg on `PATH`, built with libass (e.g. the gyan.dev Windows builds via `winget install Gyan.FFmpeg`). At startup the pipeline runs `ffmpeg -hide_banner -filters` and aborts with an install hint if the `ass` filter is missing.
 
 ### Python packages
