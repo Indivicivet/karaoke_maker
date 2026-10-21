@@ -5,7 +5,7 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 ## Requirements
 
 ### Execution and workflow
-- Single-command execution: Running `python karaoke_maker.py "song.mp3"` with only an audio file must run end-to-end and produce a completed MP4.
+- Single-command execution: Running `python karaoke_maker.py "song.mp3"` with only an audio file runs end-to-end and produces a completed MP4.
 - Song workspace folder: Each run creates a dedicated output folder for the song containing the final video and all intermediate artifacts (stems, extracted MIDI, generated ASS subtitles, and lyrics).
 - Resume and manual edit capability: Stages check for existing artifacts in the workspace before computing. If an artifact exists (or was manually edited), the pipeline picks it up and continues without re-running completed steps.
 - Lyrics handling: If a lyrics file is not provided, the pipeline transcribes the vocals automatically. If a lyrics file is provided or already exists in the song folder, it is used directly and never overwritten.
@@ -17,10 +17,7 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 
 ### Audio stem balance and volume input
 - Independent controls: Support separate levels for backing music, guide melody chime, and original vocal bleed.
-- Flexible volume input: Volume flags accept three formats:
-  - Ratios: `0`, `0.3`, `1.0`
-  - Percentages: `0%`, `30%`, `100%`
-  - Decibels: explicit strings like `-6dB` or negative numbers like `-10`, which are parsed as decibel values.
+- Flexible volume input: Volume flags accept ratios (`0.3`), percentages (`30%`), and decibels (explicit `-6dB` or negative numbers like `-10` treated as dB).
 - Audio layouts: Support a combined stereo master mix, a dual-track container with selectable audio streams (pure off-vocal vs. guide assist), and a left/right hardware split (instrumental and guide on left, vocals on right).
 
 ### Video backgrounds
@@ -70,37 +67,30 @@ Input song (audio) [+ optional plain text lyrics]
         └── Output: 1080p MP4
 ```
 
-## Subtitle engine (ASS)
+## Subtitle generation details (ASS)
 
-### Styling rules
-- Format: Advanced SubStation Alpha (.ass v4.00+).
-- Fill animation: Smooth progressive color fill using `\kf<duration_cs>` tags across text and outlines.
-- Two-line alternation: Line 1 sits on top (or row A) and line 2 sits on the bottom (or row B). While line 1 is active, line 2 shows upcoming lyrics in advance in inactive grey or white, matching arcade displays. When line 1 finishes, line 3 replaces it before its cue starts.
-- Furigana layout: Furigana text sits directly above the associated kanji at roughly 45% to 50% of the main font size. The duration of the kanji wipe matches the total duration of the furigana morae above it. Note: ASS has no native ruby layout tag. Aligning furigana with whitespace padding fails on proportional fonts because kanji and spaces have different character widths. Production implementations need pixel-width measurements per segment or coordinate-anchored `\pos` tags.
+- Subtitle format: Advanced SubStation Alpha (.ass v4.00+).
+- Fill tag: Progressive fill is implemented using `\kf<duration_cs>` overrides across primary and secondary fill styles.
+- Ruby positioning: ASS lacks a native ruby tag. Whitespace padding drifts on proportional fonts; production generation requires calculating bounding-box widths per kanji group (e.g. via font metrics) and placing furigana using absolute `\pos(x, y)` coordinates, or compiling through an Aegisub-compatible template pass.
 
-## Audio mixing and stem balancing
+## Audio mixing implementation
 
-The pipeline balances three audio streams before muxing:
-- Instrumental backing track
-- Guide chime melody (synthesized bells)
-- Original vocal bleed (optional, useful for practice tracks)
+### FFmpeg layouts
+- Master mix (`--audio-layout mix`): Merges stems into one stereo stream via `amix=inputs=3:normalize=0`. Disabling normalization preserves absolute input volume multipliers.
+- Dual-track (`--audio-layout dual-track`): Muxes stream 0 as clean instrumental (`1:a`) and stream 1 as the guide/vocal blend (`[a_mix]`).
+- Left/right split (`--audio-layout split-lr`): Pans instrumental and guide chime to channel 0 (left) and vocal guide to channel 1 (right) via `join=inputs=2:channel_layout=stereo`.
 
-### Mixing options
-- Master stereo mix (`--audio-layout mix`): Blends instrumental, guide chime, and vocals into a single stereo track. When using FFmpeg's `amix` filter, `normalize=0` should be set to prevent automatic volume drops when inputs are combined.
-- Dual-track container (`--audio-layout dual-track`): Saves two selectable audio streams into the MP4 container. Track 1 is the clean off-vocal backing, and track 2 is the karaoke mix with guide chime and vocal hints.
-- Left/right split (`--audio-layout split-lr`): Classic karaoke hardware split. The left channel carries backing music and the guide chime, while the right channel carries the vocal guide, allowing physical mixers to dial in vocals via pan pots.
+### Volume parsing
+Input strings convert to linear amplitude multipliers before building FFmpeg filtergraphs:
+- Ratios (`1.0`, `0.3`): Used directly.
+- Percentages (`30%`): `val / 100`.
+- Decibels (`-10dB`, `-10`): `10 ** (dB / 20)`. Zero volume (mute) maps to amplitude `0.0`.
 
-### Volume parsing rules
-Volume options parse three input types into linear amplitude multipliers:
-- Ratios: Floats from 0.0 to 1.0 (or greater) map directly.
-- Percentages: `X%` maps to `X / 100`.
-- Decibels: Any value ending in `dB` or any negative numeric value (e.g. `-10`) converts via `10 ** (dB / 20)`.
-
-| Option | Accepted syntax | Default | Description |
-|---|---|---|---|
-| `--inst-vol` | `1.0`, `100%`, `0dB` | `1.0` | Instrumental volume |
-| `--guide-vol` | `0.3`, `30%`, `-10dB` | `0.3` | Guide melody chime volume (0 mutes) |
-| `--vocal-vol` | `0.0`, `0%`, `-inf` | `0.0` | Vocal bleed volume (0 for clean karaoke) |
+| Option | Flag | Default |
+|---|---|---|
+| Instrumental level | `--inst-vol` | `1.0` |
+| Guide chime level | `--guide-vol` | `0.3` |
+| Vocal guide level | `--vocal-vol` | `0.0` |
 
 ## Command-line interface
 
