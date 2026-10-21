@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -239,6 +240,15 @@ def run_ffmpeg_with_progress(cmd: list[str], duration_sec: float, label: str):
     assert proc.stdout is not None
     assert proc.stderr is not None
 
+    stderr_lines: list[str] = []
+
+    def _drain_stderr():
+        for ln in proc.stderr:
+            stderr_lines.append(ln)
+
+    drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    drain_thread.start()
+
     for line in proc.stdout:
         line = line.strip()
         if line.startswith("out_time_us="):
@@ -253,9 +263,10 @@ def run_ffmpeg_with_progress(cmd: list[str], duration_sec: float, label: str):
         elif line == "progress=end":
             print(f"\r  {label}: 100.0%", flush=True)
 
-    stderr_out = proc.stderr.read()
     ret = proc.wait()
+    drain_thread.join(timeout=2.0)
     if ret != 0:
+        stderr_out = "".join(stderr_lines)
         print(stderr_out, file=sys.stderr)
         raise RuntimeError(f"FFmpeg command failed with exit code {ret}")
 
@@ -475,6 +486,7 @@ def stage3_align(
         return False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    total_vram_gb = 0.0
     if device == "cuda":
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         if total_vram_gb < 6.0 and whisper_model.startswith("large"):
@@ -495,15 +507,9 @@ def stage3_align(
 
     whisper_cache = CACHE_DIR / "models" / "whisper"
     whisper_cache.mkdir(parents=True, exist_ok=True)
-    if device == "cuda":
-        model = stable_whisper.load_model(
-            whisper_model, device="cpu", download_root=str(whisper_cache)
-        )
-        model = model.half().to("cuda")
-    else:
-        model = stable_whisper.load_model(
-            whisper_model, device="cpu", download_root=str(whisper_cache)
-        )
+    model = stable_whisper.load_model(
+        whisper_model, device=device, download_root=str(whisper_cache)
+    )
 
     if lyrics_txt.exists() and (has_user_lyrics or not force):
         raw_lines = [
@@ -528,7 +534,10 @@ def stage3_align(
                 chunks = []
             out_lines.append({"text": clean_ln, "chunks": chunks})
     else:
-        result = model.transcribe(str(vocals_wav), language="ja")
+        transcribe_kwargs = {"language": "ja"}
+        if device == "cuda" and total_vram_gb < 6.0:
+            transcribe_kwargs["fp16"] = False
+        result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
         transcribed_lines = []
         out_lines = []
         for seg in result.segments:
