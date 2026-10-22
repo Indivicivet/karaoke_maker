@@ -968,14 +968,12 @@ def stage4_ass(
         sung_out = "&H000028B8"
         shad_col = "&H80000000"
 
-    base_fs = 92.0
-    ruby_fs = 42.0
-    base_bord = 5.5
-    ruby_bord = 3.0
-    shad = 3.0
-    margin_x = 100.0
+    max_base_fs = 135.0
+    min_base_fs = 72.0
+    ruby_ratio = 0.45
+    margin_x = 80.0
     safe_width = 1920.0 - 2.0 * margin_x
-    slot_y = (430.0, 610.0)
+    slot_y = (400.0, 620.0)
     ruby_gap = 8.0
 
     header = f"""[Script Info]
@@ -988,10 +986,10 @@ Kerning: no
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: BaseUnsung,{metrics.family_name},{int(base_fs)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,{base_bord:g},{shad:g},7,0,0,0,1
-Style: BaseSung,{metrics.family_name},{int(base_fs)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,{base_bord:g},{shad:g},7,0,0,0,1
-Style: RubyUnsung,{metrics.family_name},{int(ruby_fs)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,{ruby_bord:g},{shad:g},7,0,0,0,1
-Style: RubySung,{metrics.family_name},{int(ruby_fs)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,{ruby_bord:g},{shad:g},7,0,0,0,1
+Style: BaseUnsung,{metrics.family_name},{int(max_base_fs)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,6,3,7,0,0,0,1
+Style: BaseSung,{metrics.family_name},{int(max_base_fs)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,6,3,7,0,0,0,1
+Style: RubyUnsung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
+Style: RubySung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1071,30 +1069,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ts_str = format_ass_time(disp_s)
         te_str = format_ass_time(disp_e)
 
-        unscaled_w = metrics.text_width(plain, base_fs, 1.0)
-        scale_x = min(1.0, safe_width / unscaled_w) if unscaled_w > 0 else 1.0
+        unit_w = metrics.text_width(plain, 1.0, 1.0)
+        if unit_w > 0:
+            fit_fs = safe_width / unit_w
+            line_fs = min(max_base_fs, fit_fs)
+            if line_fs < min_base_fs:
+                line_fs = min_base_fs
+                scale_x = safe_width / (unit_w * min_base_fs)
+            else:
+                scale_x = 1.0
+        else:
+            line_fs = max_base_fs
+            scale_x = 1.0
+
         fscx_pct = int(round(scale_x * 100))
         fscx_tag = f"\\fscx{fscx_pct}" if fscx_pct != 100 else ""
-        total_w = unscaled_w * scale_x
+        total_w = unit_w * line_fs * scale_x
 
         line_x = (1920.0 - total_w) * 0.5
         line_y = slot_y[slot]
 
+        line_bord = round(line_fs * 0.065, 1)
+        line_shad = round(line_fs * 0.035, 1)
+
         char_x = []
         cur_x = line_x
         for ch in plain:
-            w = metrics.char_width(ch, base_fs, scale_x)
+            w = metrics.char_width(ch, line_fs, scale_x)
             char_x.append((cur_x, cur_x + w))
             cur_x += w
 
-        pos_tag = f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fscx_tag}}}"
+        fs_tag = f"\\fs{int(round(line_fs))}\\bord{line_bord:g}\\shad{line_shad:g}"
+        pos_tag = f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fs_tag}{fscx_tag}}}"
         events.append(
             f"Dialogue: 0,{ts_str},{te_str},BaseUnsung,,0,0,0,,{pos_tag}{plain}"
         )
 
-        pad_base = (base_bord + shad) * scale_x + 2.0
-        y0_base = int(math.floor(line_y - base_bord - shad - 4.0))
-        y1_base = int(math.ceil(line_y + base_fs + base_bord + shad + 4.0))
+        pad_base = (line_bord + line_shad) * scale_x + 2.0
+        y0_base = int(math.floor(line_y - line_bord - line_shad - 4.0))
+        y1_base = int(math.ceil(line_y + line_fs + line_bord + line_shad + 4.0))
 
         n_chars = len(plain)
         for c_idx in range(n_chars):
@@ -1114,7 +1127,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             rel_t0 = max(0, int(round((ct0 - disp_s) * 1000)))
             rel_t1 = max(rel_t0 + 1, int(round((ct1 - disp_s) * 1000)))
             wipe_tag = (
-                f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fscx_tag}"
+                f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fs_tag}{fscx_tag}"
                 f"\\clip({clip_x0},{y0_base},{clip_x0},{y1_base})"
                 f"\\t({rel_t0},{rel_t1},\\clip({clip_x0},{y0_base},{clip_x1},{y1_base}))}}"
             )
@@ -1123,10 +1136,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
         # Emit ruby layers
+        ruby_fs = round(line_fs * ruby_ratio, 1)
+        ruby_bord = round(ruby_fs * 0.07, 1)
+        ruby_shad = round(ruby_fs * 0.04, 1)
         ruby_y = line_y - ruby_fs - ruby_gap
-        y0_ruby = int(math.floor(ruby_y - ruby_bord - shad - 3.0))
-        y1_ruby = int(math.ceil(ruby_y + ruby_fs + ruby_bord + shad + 3.0))
-        pad_ruby = (ruby_bord + shad) * scale_x + 2.0
+        y0_ruby = int(math.floor(ruby_y - ruby_bord - ruby_shad - 3.0))
+        y1_ruby = int(math.ceil(ruby_y + ruby_fs + ruby_bord + ruby_shad + 3.0))
+        pad_ruby = (ruby_bord + ruby_shad) * scale_x + 2.0
 
         for seg in segments:
             if seg["type"] != "ruby" or not seg["ruby"]:
@@ -1146,7 +1162,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             r_total_w = r_unscaled_w * r_scale_x
 
             r_x = base_x0 + (base_span_w - r_total_w) * 0.5
-            r_pos_tag = f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fscx_tag}}}"
+            r_fs_tag = (
+                f"\\fs{int(round(ruby_fs))}\\bord{ruby_bord:g}\\shad{ruby_shad:g}"
+            )
+            r_pos_tag = f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fs_tag}{r_fscx_tag}}}"
             events.append(
                 f"Dialogue: 0,{ts_str},{te_str},RubyUnsung,,0,0,0,,{r_pos_tag}{r_text}"
             )
@@ -1184,7 +1203,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 rel_mt1 = max(rel_mt0 + 1, int(round((mt1 - disp_s) * 1000)))
 
                 r_wipe_tag = (
-                    f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fscx_tag}"
+                    f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fs_tag}{r_fscx_tag}"
                     f"\\clip({r_clip0},{y0_ruby},{r_clip0},{y1_ruby})"
                     f"\\t({rel_mt0},{rel_mt1},\\clip({r_clip0},{y0_ruby},{r_clip1},{y1_ruby}))}}"
                 )
