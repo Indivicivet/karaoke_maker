@@ -11,11 +11,14 @@ A Python command-line pipeline that turns a music file into an arcade-style (DAM
 - Song workspace folder: Each run creates a dedicated output folder for the song containing the final video and all intermediate artifacts (stems, extracted MIDI, generated ASS subtitles, and lyrics).
 - Resume and manual edit capability: Stages check for existing artifacts in the workspace before computing. If an artifact exists (or was manually edited), the pipeline picks it up and continues without re-running completed steps.
 - Lyrics handling: If a lyrics file is not provided, the pipeline transcribes the vocals automatically. If a lyrics file is provided or already exists in the song folder, it is used directly and never overwritten.
+- Online lyrics aggregation (TODO): Query online lyric databases (e.g. Genius, LRCLIB, Spotify, or Japanese lyric sites like Uta-Net) using song metadata to fetch reference lyrics before alignment when no local lyrics file is supplied.
 
 ### Lyrics and display
 - Japanese arcade styling: Dual-line display mirroring DAM and JOYSOUND layouts. The active singing line wipes progressively while the upcoming line sits in an inactive preview state.
 - Progressive color fill: A continuous horizontal color wipe over both the text body and outline synchronized with vocal delivery.
 - Kanji and furigana: Full support for kanji with ruby text (furigana) centered directly above the corresponding base characters, with synchronized wipe timings.
+- Visual countdowns and break indicators (TODO): Add visual lead-in cues (such as flashing dots or numeric countdowns) before lines begin so singers can anticipate vocal entries. For long instrumental breaks (>10 seconds), clear the display and render an instrumental break timer showing the remaining duration until the next vocal entry.
+- Duet and multi-singer support (Future exploratory TODO): Support distinct text styling and colors for multiple singers. This will require manual singer annotation syntax in `lyrics.txt` (e.g. `[Singer1]`, `[Singer2]`) or vocal diarization.
 
 ### Audio stem balance and volume input
 - Independent controls: Support separate levels for backing music, guide melody chime, and original vocal bleed.
@@ -145,6 +148,7 @@ Each stage prints a header such as `[3/7] Aligning lyrics  (total 02:14)` and a 
 - Input is `vocals.wav`, not the full mix.
 - Whisper splits Japanese into tokens and has no spaces to work with, so the "words" that stable-ts returns are token chunks of one or more characters, and a byte-level BPE token can split a kanji. Stage 3 stores these chunks unchanged, after mapping each one onto a character range of the lyric line by walking both strings in order. Dividing a chunk's time among its characters needs the readings, so that is done in Stage 4. This keeps Stage 3 independent of `lyrics_ruby.txt` edits.
 - `alignment.json` schema: `{"lines": [{"text": str, "chunks": [{"first": int, "last": int, "start": float, "end": float}]}]}`. `first` and `last` are inclusive character indices into `text`.
+- Online lyrics aggregation (TODO): Support querying lyric search providers by track metadata when `--lyrics` is omitted, populating `lyrics.txt` with external reference lyrics to avoid hallucination before running forced alignment.
 
 ### Stage 4: furigana and ASS layout
 
@@ -168,6 +172,7 @@ Dual-line arcade layout:
 - Two slots: upper line left-aligned, lower line right-aligned. Lines alternate between the slots.
 - A line appears in its slot in the inactive (unsung) colors as soon as the slot is free: when the line two places earlier has finished plus 0.3 s, or 3 s before its first character for the opening line. It is cleared 0.5 s after its last character, or earlier if the slot is needed.
 - When the gap between lines is longer than a threshold (default 8 s, e.g. an instrumental break), both slots are cleared and the next pair appears up to 3 s before it is sung.
+- Instrumental break indicator and countdowns (TODO): When an instrumental gap exceeds 10 seconds, clear both slots and display an instrumental break indicator showing the seconds remaining until the next phrase. In the final 2-3 seconds before singing resumes (or before the song's first line), display visual lead-in cues (such as 3-2-1 countdown dots) to cue the singer.
 
 Wipe (body and outline):
 - `\kf` cannot be used. It sweeps only the fill (Secondary → Primary); the outline keeps `OutlineColour` the whole time, which does not meet the "body and outline" requirement.
