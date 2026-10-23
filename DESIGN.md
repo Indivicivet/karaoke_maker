@@ -188,7 +188,9 @@ Wipe (body and outline):
 - Treat a frame as voiced when periodicity > 0.5, the frame RMS is above a gate set relative to the stem's peak RMS, and the frame falls within an aligned lyric chunk window (±50 ms). Bridge brief unvoiced dropouts (≤ 50 ms) when neighboring pitches match, then apply a median filter within each contiguous voiced segment so unvoiced zeros do not pull boundary frames down.
 - Segment notes: start a new note when the pitch shifts by ≥ 0.75 semitones from the current note's median and sustains the new pitch for ≥ 120 ms (hysteresis against vibrato and scoops), and also at chunk onsets from `alignment.json` once the current note has lasted ≥ 120 ms. Absorb brief pre-note scoops (< 120 ms) and rapid 1-semitone ornamentation blips into the surrounding note, and drop notes shorter than 70 ms. The output is monophonic by construction.
 - Write `guide.mid` with mido (0-based General MIDI program 11 Vibraphone or 9 Glockenspiel, matching `--guide-timbre`, for DAW users).
-- Synthesize `guide.wav` from `guide.mid` (so that MIDI edits are honored) as a warm additive mallet tone: fundamental + 2× + 4× partials for vibraphone-like (or brighter for glockenspiel-like via `--guide-timbre`), softened raised-cosine attack and further attenuated overtones on legato transitions, gentle vibrato on sustained notes, and peak-normalized to −1 dBFS, at the length of `source.wav`.
+- Synthesize `guide.wav` according to `--guide-timbre` (default `continuous`):
+  - `continuous`: directly drives a warm phase-continuous oscillator (`1× + 0.22×2 + 0.06×3` harmonics) from the smoothed continuous f0 contour and the vocal stem's own smoothed RMS/periodicity envelope, avoiding discrete note attacks or semitone quantization.
+  - `vibraphone` / `glockenspiel`: synthesizes discrete notes from `guide.mid` (so that MIDI edits are honored) as a warm additive mallet tone, with softened raised-cosine attack and attenuated overtones on legato transitions. All guide outputs are peak-normalized to −1 dBFS at the length of `source.wav`.
 
 ### Stage 6: background
 - No `--bg`: use `cache/bg/bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
@@ -261,7 +263,7 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 | `--audio-layout` | `mix` | `mix`, `dual-track` or `split-lr`. |
 | `--inst-vol`, `--guide-vol`, `--vocal-vol` | see table | Stem levels. |
 | `--style` | `dam` | `dam` or `joysound` color/layout preset. |
-| `--guide-timbre` | `vibraphone` | `vibraphone` or `glockenspiel`. |
+| `--guide-timbre` | `continuous` | `continuous`, `vibraphone`, or `glockenspiel`. |
 | `--whisper-model` | `large-v3` (or `medium` if <6GB VRAM) | Whisper model name for stable-ts. |
 | `--language` | `auto` | Spoken language code for Whisper (`auto`, `ja`, `en`, etc.). Auto-detects from vocals or lyrics. |
 | `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |

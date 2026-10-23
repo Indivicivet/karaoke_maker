@@ -30,7 +30,7 @@ import fugashi
 import mido
 from mido import Message, MetaMessage, MidiFile, MidiTrack
 import numpy as np
-from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.signal import resample_poly
 import soundfile as sf
 import stable_whisper
@@ -1397,6 +1397,98 @@ def synthesize_mallet_guide(
     sf.write(str(out_wav), stereo, sr, subtype="FLOAT")
 
 
+def synthesize_continuous_guide(
+    midi_filt: np.ndarray,
+    voiced_bridged: np.ndarray,
+    rms: np.ndarray,
+    pd_np: np.ndarray,
+    out_wav: Path,
+    duration_sec: float,
+    sr: int = 44100,
+):
+    total_samples = int(round(duration_sec * sr))
+    n_frames = len(midi_filt)
+    if n_frames == 0 or total_samples <= 0:
+        stereo = np.zeros((max(1, total_samples), 2), dtype=np.float32)
+        sf.write(str(out_wav), stereo, sr, subtype="FLOAT")
+        return
+
+    # Smooth continuous pitch contour within each voiced segment and hold pitch across
+    # unvoiced regions so release tails never dive toward 0 Hz.
+    smooth_midi = np.zeros(n_frames, dtype=np.float32)
+    idx = 0
+    last_pitch = 60.0
+    while idx < n_frames:
+        if voiced_bridged[idx] and midi_filt[idx] > 0:
+            end_idx = idx
+            while (
+                end_idx < n_frames
+                and voiced_bridged[end_idx]
+                and midi_filt[end_idx] > 0
+            ):
+                end_idx += 1
+            seg = gaussian_filter1d(
+                midi_filt[idx:end_idx], sigma=1.5, mode="nearest"
+            ).astype(np.float32)
+            smooth_midi[idx:end_idx] = seg
+            if idx > 0 and idx == len(smooth_midi[:idx]):
+                # Fill any initial unvoiced prefix with the first voiced pitch
+                if not np.any(voiced_bridged[:idx]):
+                    smooth_midi[:idx] = float(seg[0])
+            last_pitch = float(seg[-1])
+            idx = end_idx
+        else:
+            end_idx = idx
+            while end_idx < n_frames and not (
+                voiced_bridged[end_idx] and midi_filt[end_idx] > 0
+            ):
+                end_idx += 1
+            next_pitch = float(midi_filt[end_idx]) if end_idx < n_frames else last_pitch
+            mid_gap = idx + (end_idx - idx) // 2
+            smooth_midi[idx:mid_gap] = last_pitch
+            smooth_midi[mid_gap:end_idx] = next_pitch
+            idx = end_idx
+
+    f0_frames = 440.0 * (2.0 ** ((smooth_midi - 69.0) / 12.0))
+
+    # Build a smooth amplitude envelope from vocal RMS and periodicity
+    peak_rms = float(np.max(rms[voiced_bridged])) if np.any(voiced_bridged) else 0.0
+    if peak_rms > 1e-6:
+        norm_rms = np.clip(rms / peak_rms, 0.0, 1.0) ** 0.55
+    else:
+        norm_rms = np.zeros(n_frames, dtype=np.float32)
+    pd_weight = np.clip((pd_np - 0.35) / 0.45, 0.0, 1.0)
+    raw_env = np.where(voiced_bridged, norm_rms * pd_weight, 0.0).astype(np.float32)
+    env_frames = gaussian_filter1d(
+        raw_env, sigma=2.2, mode="constant", cval=0.0
+    ).astype(np.float32)
+
+    frame_times = np.arange(n_frames, dtype=np.float32) * 0.01
+    sample_times = np.arange(total_samples, dtype=np.float32) / float(sr)
+    f0_samp = np.interp(
+        sample_times, frame_times, f0_frames, left=f0_frames[0], right=f0_frames[-1]
+    ).astype(np.float32)
+    env_samp = np.interp(
+        sample_times, frame_times, env_frames, left=0.0, right=0.0
+    ).astype(np.float32)
+
+    dphase = (2.0 * np.pi * f0_samp / float(sr)).astype(np.float64)
+    phase = np.cumsum(dphase)
+
+    # Warm, flute/soft-synth harmonic profile (fundamental + gentle 2nd & 3rd harmonics)
+    buf = (
+        np.sin(phase) + 0.22 * np.sin(2.0 * phase) + 0.06 * np.sin(3.0 * phase)
+    ).astype(np.float32) * env_samp
+
+    peak = float(np.max(np.abs(buf)))
+    if peak > 1e-6:
+        target_peak = 10.0 ** (-1.0 / 20.0)
+        buf *= target_peak / peak
+
+    stereo = np.column_stack([buf, buf])
+    sf.write(str(out_wav), stereo, sr, subtype="FLOAT")
+
+
 def stage5_guide(
     workspace: Path,
     guide_timbre: str,
@@ -1415,7 +1507,24 @@ def stage5_guide(
     )
     run_mid, kept_mid = check_stage_status([guide_mid], mid_fp, manifest, force)
 
-    if run_mid:
+    wav_upstream = (
+        [vocals_wav, alignment_json, source_wav]
+        if guide_timbre == "continuous"
+        else [guide_mid, source_wav]
+    )
+    wav_fp = compute_fingerprint(
+        wav_upstream,
+        {"stage": "5_wav_v3", "timbre": guide_timbre},
+    )
+    run_wav, kept_wav = check_stage_status([guide_wav], wav_fp, manifest, force)
+
+    need_crepe = run_mid or (run_wav and guide_timbre == "continuous")
+    midi_filt = np.zeros(0, dtype=np.float32)
+    voiced_bridged = np.zeros(0, dtype=bool)
+    rms = np.zeros(0, dtype=np.float32)
+    pd_np = np.zeros(0, dtype=np.float32)
+
+    if need_crepe:
         audio, sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
         mono = audio.mean(axis=1)
         target_sr = 16000
@@ -1530,127 +1639,140 @@ def stage5_guide(
             else:
                 idx += 1
 
-        min_note_frames = 7
-        scoop_frames = 12
-        hyst_semitones = 0.75
-        sustain_frames = 12
+        if run_mid:
+            min_note_frames = 7
+            scoop_frames = 12
+            hyst_semitones = 0.75
+            sustain_frames = 12
 
-        raw_notes = []
-        cur_start = None
-        cur_frames: list[float] = []
+            raw_notes = []
+            cur_start = None
+            cur_frames: list[float] = []
 
-        for i in range(n_frames):
-            if not voiced_bridged[i] or midi_filt[i] <= 0:
-                if cur_start is not None:
-                    if (i - cur_start) >= min_note_frames:
-                        pitch = int(round(float(np.median(cur_frames))))
-                        raw_notes.append((cur_start * 0.01, i * 0.01, pitch))
-                    cur_start = None
-                    cur_frames = []
-                continue
+            for i in range(n_frames):
+                if not voiced_bridged[i] or midi_filt[i] <= 0:
+                    if cur_start is not None:
+                        if (i - cur_start) >= min_note_frames:
+                            pitch = int(round(float(np.median(cur_frames))))
+                            raw_notes.append((cur_start * 0.01, i * 0.01, pitch))
+                        cur_start = None
+                        cur_frames = []
+                    continue
 
-            val = float(midi_filt[i])
-            if cur_start is None:
-                cur_start = i
-                cur_frames = [val]
-                continue
-
-            cur_len = i - cur_start
-            ahead_voiced = i + min_note_frames <= n_frames and bool(
-                np.all(voiced_bridged[i : i + min_note_frames])
-            )
-            retrigger = (
-                (i in onset_frames) and (cur_len >= sustain_frames) and ahead_voiced
-            )
-            is_pitch_split = False
-            if not retrigger:
-                cur_med_float = float(np.median(cur_frames))
-                cur_pitch = int(round(cur_med_float))
-                if (
-                    abs(val - cur_med_float) >= hyst_semitones
-                    and int(round(val)) != cur_pitch
-                ):
-                    ahead = midi_filt[i : min(n_frames, i + sustain_frames)]
-                    ahead_v = voiced_bridged[i : min(n_frames, i + sustain_frames)]
-                    if len(ahead) == sustain_frames and np.all(ahead_v):
-                        target_pitch = int(round(float(np.median(ahead))))
-                        if (
-                            target_pitch != cur_pitch
-                            and np.all(np.abs(ahead - cur_med_float) >= hyst_semitones)
-                            and np.all(np.abs(ahead - target_pitch) <= 0.65)
-                        ):
-                            retrigger = True
-                            is_pitch_split = True
-
-            if retrigger:
-                min_prev = scoop_frames if is_pitch_split else min_note_frames
-                if cur_len >= min_prev:
-                    pitch = int(round(float(np.median(cur_frames))))
-                    raw_notes.append((cur_start * 0.01, i * 0.01, pitch))
+                val = float(midi_filt[i])
+                if cur_start is None:
                     cur_start = i
                     cur_frames = [val]
-                else:
-                    cur_frames = [val]
-            else:
-                cur_frames.append(val)
-
-        if cur_start is not None and (n_frames - cur_start) >= min_note_frames:
-            pitch = int(round(float(np.median(cur_frames))))
-            raw_notes.append((cur_start * 0.01, n_frames * 0.01, pitch))
-
-        notes = []
-        idx = 0
-        while idx < len(raw_notes):
-            if idx + 2 < len(raw_notes):
-                t0_a, t1_a, p_a = raw_notes[idx]
-                t0_b, t1_b, p_b = raw_notes[idx + 1]
-                t0_c, t1_c, p_c = raw_notes[idx + 2]
-                if (
-                    p_a == p_c
-                    and abs(p_b - p_a) == 1
-                    and (t1_b - t0_b) < 0.25
-                    and (t0_b - t1_a) <= 0.05
-                    and (t0_c - t1_b) <= 0.05
-                ):
-                    raw_notes[idx + 2] = (t0_a, t1_c, p_a)
-                    idx += 2
                     continue
-            notes.append(raw_notes[idx])
-            idx += 1
 
-        mid = MidiFile(ticks_per_beat=480)
-        track = MidiTrack()
-        mid.tracks.append(track)
-        tempo = 500000
-        track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
-        program = 9 if guide_timbre == "glockenspiel" else 11
-        track.append(Message("program_change", program=program, time=0))
+                cur_len = i - cur_start
+                ahead_voiced = i + min_note_frames <= n_frames and bool(
+                    np.all(voiced_bridged[i : i + min_note_frames])
+                )
+                retrigger = (
+                    (i in onset_frames) and (cur_len >= sustain_frames) and ahead_voiced
+                )
+                is_pitch_split = False
+                if not retrigger:
+                    cur_med_float = float(np.median(cur_frames))
+                    cur_pitch = int(round(cur_med_float))
+                    if (
+                        abs(val - cur_med_float) >= hyst_semitones
+                        and int(round(val)) != cur_pitch
+                    ):
+                        ahead = midi_filt[i : min(n_frames, i + sustain_frames)]
+                        ahead_v = voiced_bridged[i : min(n_frames, i + sustain_frames)]
+                        if len(ahead) == sustain_frames and np.all(ahead_v):
+                            target_pitch = int(round(float(np.median(ahead))))
+                            if (
+                                target_pitch != cur_pitch
+                                and np.all(
+                                    np.abs(ahead - cur_med_float) >= hyst_semitones
+                                )
+                                and np.all(np.abs(ahead - target_pitch) <= 0.65)
+                            ):
+                                retrigger = True
+                                is_pitch_split = True
 
-        last_t = 0.0
-        for t0, t1, pitch in notes:
-            dt_on = max(0.0, t0 - last_t)
-            ticks_on = int(round(mido.second2tick(dt_on, 480, tempo)))
-            track.append(Message("note_on", note=pitch, velocity=100, time=ticks_on))
-            dt_off = max(0.0, t1 - t0)
-            ticks_off = int(round(mido.second2tick(dt_off, 480, tempo)))
-            track.append(Message("note_off", note=pitch, velocity=0, time=ticks_off))
-            last_t = t1
+                if retrigger:
+                    min_prev = scoop_frames if is_pitch_split else min_note_frames
+                    if cur_len >= min_prev:
+                        pitch = int(round(float(np.median(cur_frames))))
+                        raw_notes.append((cur_start * 0.01, i * 0.01, pitch))
+                        cur_start = i
+                        cur_frames = [val]
+                    else:
+                        cur_frames = [val]
+                else:
+                    cur_frames.append(val)
 
-        mid.save(str(guide_mid))
-        record_artifacts([guide_mid], kept_mid, mid_fp, manifest, workspace)
+            if cur_start is not None and (n_frames - cur_start) >= min_note_frames:
+                pitch = int(round(float(np.median(cur_frames))))
+                raw_notes.append((cur_start * 0.01, n_frames * 0.01, pitch))
 
-    wav_fp = compute_fingerprint(
-        [guide_mid, source_wav],
-        {"stage": "5_wav_v2", "timbre": guide_timbre},
-    )
-    run_wav, kept_wav = check_stage_status([guide_wav], wav_fp, manifest, force)
+            notes = []
+            idx = 0
+            while idx < len(raw_notes):
+                if idx + 2 < len(raw_notes):
+                    t0_a, t1_a, p_a = raw_notes[idx]
+                    t0_b, t1_b, p_b = raw_notes[idx + 1]
+                    t0_c, t1_c, p_c = raw_notes[idx + 2]
+                    if (
+                        p_a == p_c
+                        and abs(p_b - p_a) == 1
+                        and (t1_b - t0_b) < 0.25
+                        and (t0_b - t1_a) <= 0.05
+                        and (t0_c - t1_b) <= 0.05
+                    ):
+                        raw_notes[idx + 2] = (t0_a, t1_c, p_a)
+                        idx += 2
+                        continue
+                notes.append(raw_notes[idx])
+                idx += 1
+
+            mid = MidiFile(ticks_per_beat=480)
+            track = MidiTrack()
+            mid.tracks.append(track)
+            tempo = 500000
+            track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
+            program = 9 if guide_timbre == "glockenspiel" else 11
+            track.append(Message("program_change", program=program, time=0))
+
+            last_t = 0.0
+            for t0, t1, pitch in notes:
+                dt_on = max(0.0, t0 - last_t)
+                ticks_on = int(round(mido.second2tick(dt_on, 480, tempo)))
+                track.append(
+                    Message("note_on", note=pitch, velocity=100, time=ticks_on)
+                )
+                dt_off = max(0.0, t1 - t0)
+                ticks_off = int(round(mido.second2tick(dt_off, 480, tempo)))
+                track.append(
+                    Message("note_off", note=pitch, velocity=0, time=ticks_off)
+                )
+                last_t = t1
+
+            mid.save(str(guide_mid))
+            record_artifacts([guide_mid], kept_mid, mid_fp, manifest, workspace)
+
     if not run_wav:
         return run_mid
 
     info = sf.info(str(source_wav))
-    synthesize_mallet_guide(
-        guide_mid, guide_wav, info.duration, guide_timbre, sr=info.samplerate
-    )
+    if guide_timbre == "continuous":
+        synthesize_continuous_guide(
+            midi_filt,
+            voiced_bridged,
+            rms,
+            pd_np,
+            guide_wav,
+            info.duration,
+            sr=info.samplerate,
+        )
+    else:
+        synthesize_mallet_guide(
+            guide_mid, guide_wav, info.duration, guide_timbre, sr=info.samplerate
+        )
     record_artifacts([guide_wav], kept_wav, wav_fp, manifest, workspace)
     return True
 
@@ -1999,8 +2121,8 @@ def main():
     )
     parser.add_argument(
         "--guide-timbre",
-        choices=["vibraphone", "glockenspiel"],
-        default="vibraphone",
+        choices=["continuous", "vibraphone", "glockenspiel"],
+        default="continuous",
         help="Guide melody synthesis timbre",
     )
     default_whisper = "large-v3"
