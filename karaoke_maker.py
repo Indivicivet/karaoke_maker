@@ -990,6 +990,8 @@ Style: BaseUnsung,{metrics.family_name},{int(max_base_fs)},{unsung_fill},{unsung
 Style: BaseSung,{metrics.family_name},{int(max_base_fs)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,6,3,7,0,0,0,1
 Style: RubyUnsung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
 Style: RubySung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
+Style: BreakTimer,{metrics.family_name},54,{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,4,2,5,0,0,0,1
+Style: LeadInDot,{metrics.family_name},90,{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,5,3,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1027,9 +1029,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         item["slot"] = slot_idx
 
     for i, item in enumerate(parsed_lines):
-        is_pair_start = i == 0 or (
-            item["start"] - parsed_lines[i - 1]["end"] > break_threshold
+        gap_before = (
+            (item["start"] - parsed_lines[i - 1]["end"]) if i > 0 else item["start"]
         )
+        is_break = gap_before > break_threshold
+
+        is_pair_start = i == 0 or is_break
         if is_pair_start:
             disp_start = max(0.0, item["start"] - 3.0)
             if i > 0:
@@ -1057,6 +1062,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         item["disp_start"] = disp_start
         item["disp_end"] = max(item["end"], disp_end)
+        item["is_break_entry"] = is_break or (i == 0)
 
     events = []
     for item in parsed_lines:
@@ -1210,6 +1216,53 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 events.append(
                     f"Dialogue: 1,{ts_str},{te_str},RubySung,,0,0,0,,{r_wipe_tag}{r_text}"
                 )
+
+    # Add instrumental break indicators (>10s gap) and visual lead-in cues (countdown dots)
+    for i, item in enumerate(parsed_lines):
+        prev_end = parsed_lines[i - 1]["end"] if i > 0 else 0.0
+        gap_duration = item["start"] - prev_end
+        lead_in_start = item["start"] - 3.0
+
+        if gap_duration > 10.0:
+            break_disp_start = max(0.0, prev_end + 0.5)
+            break_disp_end = lead_in_start
+            if break_disp_end > break_disp_start:
+                # Render second-by-second countdown for the instrumental break.
+                # Align interval bounds to whole seconds counting down to lead_in_start.
+                t = break_disp_start
+                pos_tag = r"{\pos(960,540)}"
+                while t < break_disp_end:
+                    # Time remaining until item["start"]
+                    rem_sec = max(1, int(math.ceil(item["start"] - t)))
+                    # The next step boundary is when remaining seconds changes
+                    next_t = min(break_disp_end, item["start"] - (rem_sec - 1))
+                    if next_t <= t:
+                        next_t = min(break_disp_end, t + 1.0)
+                    t0_str = format_ass_time(t)
+                    t1_str = format_ass_time(next_t)
+                    events.append(
+                        f"Dialogue: 0,{t0_str},{t1_str},BreakTimer,,0,0,0,,{pos_tag}♪ 間奏 ({rem_sec})"
+                    )
+                    t = next_t
+
+        if item.get("is_break_entry", False) and item["start"] >= 2.0:
+            # 3-2-1 countdown dots in the 3 seconds preceding vocal start
+            # 3 dots: at x = 860, 960, 1060, y = 540
+            # Dot 1 appears at start - 3.0 (or max(0, start-3.0))
+            # Dot 2 appears at start - 2.0
+            # Dot 3 appears at start - 1.0
+            # All disappear at start
+            dot_xs = [860, 960, 1060]
+            for dot_idx, x_pos in enumerate(dot_xs):
+                d_t0 = max(0.0, item["start"] - (3.0 - dot_idx))
+                d_t1 = item["start"]
+                if d_t1 > d_t0:
+                    t0_str = format_ass_time(d_t0)
+                    t1_str = format_ass_time(d_t1)
+                    pos_tag = rf"{{\pos({x_pos},540)}}"
+                    events.append(
+                        f"Dialogue: 0,{t0_str},{t1_str},LeadInDot,,0,0,0,,{pos_tag}●"
+                    )
 
     karaoke_ass.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     record_artifacts([karaoke_ass], kept_ass, ass_input_fp, manifest, workspace)
