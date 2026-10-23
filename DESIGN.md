@@ -169,10 +169,10 @@ Layout (all coordinates use `PlayResX=1920`, `PlayResY=1080`, `ScaledBorderAndSh
 - A line wider than the safe area (1920 − 2×margin) is scaled down horizontally with `\fscx`, and the layout widths are scaled by the same factor.
 
 Dual-line arcade layout:
-- Two slots: upper line left-aligned, lower line right-aligned. Lines alternate between the slots.
-- A line appears in its slot in the inactive (unsung) colors as soon as the slot is free: when the line two places earlier has finished plus 0.3 s, or 3 s before its first character for the opening line. It is cleared 0.5 s after its last character, or earlier if the slot is needed.
-- When the gap between lines is longer than a threshold (default 8 s, e.g. an instrumental break), both slots are cleared and the next pair appears up to 3 s before it is sung.
-- Instrumental break indicator and countdowns: When an instrumental gap exceeds 10 seconds, clear both slots and display an instrumental break indicator showing the seconds remaining until the next phrase. In the final 2-3 seconds before singing resumes (or before the song's first line), display visual lead-in cues (3-2-1 countdown dots) to cue the singer.
+- Two slots: upper line and lower line, both horizontally centered. Lines alternate between the slots within a continuous singing passage.
+- Stanza resets: When the pause between lines is at least 2.5 s, both slots clear after the previous line finishes (leaving a brief blank gap) and the next pair resets to the upper slot (`slot 0`) so static pairs always read top-to-bottom.
+- Slot reuse within a stanza: When a slot is reused during continuous singing, the finished line clears ~0.3 s after its last character and the new line waits at least ~0.35 s before appearing (up to 2.5 s before it is sung), avoiding zero-frame in-place text swaps.
+- Instrumental break indicator and countdowns: When an instrumental gap exceeds 10 seconds, clear both slots and display an instrumental break indicator showing the seconds remaining until the next phrase. Before the song's first line (when ≥ 2 s) and after pauses ≥ 5 seconds, display 3-2-1 countdown dots above the start of the upcoming line.
 
 Wipe (body and outline):
 - `\kf` cannot be used. It sweeps only the fill (Secondary → Primary); the outline keeps `OutlineColour` the whole time, which does not meet the "body and outline" requirement.
