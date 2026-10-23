@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import difflib
 import gc
 import hashlib
 import json
@@ -399,11 +400,95 @@ def strip_ruby_overrides(line: str) -> str:
     return re.sub(r"\{([^|{}]+)\|([^{}]+)\}", r"\1", line)
 
 
+def clean_for_match(text: str) -> str:
+    """Normalizes text for fuzzy matching by removing punctuation and whitespace."""
+    return re.sub(r"[\W_]+", "", text.lower())
+
+
+def match_lines_to_segments(clean_lines: list[str], segments: list) -> list[list]:
+    """Matches user lyric lines to Whisper segments using DP alignment.
+
+    Handles dropped lines, inserted segments, and line splits without cascading
+    off-by-one desynchronization. Returns a list of word lists, one per input line.
+    """
+    m = len(clean_lines)
+    s = len(segments)
+    if m == 0 or s == 0:
+        return [[] for _ in clean_lines]
+
+    line_norms = [clean_for_match(ln) for ln in clean_lines]
+    seg_norms = [clean_for_match(getattr(seg, "text", "")) for seg in segments]
+
+    gap_penalty = -0.3
+    dp = [[0.0] * (s + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        dp[i][0] = i * gap_penalty
+    for j in range(1, s + 1):
+        dp[0][j] = j * gap_penalty
+
+    for i in range(1, m + 1):
+        ln_norm = line_norms[i - 1]
+        for j in range(1, s + 1):
+            sg_norm = seg_norms[j - 1]
+            if ln_norm == sg_norm:
+                ratio = 1.0
+            elif ln_norm and sg_norm and (sg_norm in ln_norm or ln_norm in sg_norm):
+                ratio = 0.85
+            elif ln_norm and sg_norm:
+                ratio = difflib.SequenceMatcher(None, ln_norm, sg_norm).ratio()
+            else:
+                ratio = 0.0
+
+            match_score = (ratio - 0.4) * 2.0
+            dp[i][j] = max(
+                dp[i - 1][j - 1] + match_score,
+                dp[i - 1][j] + gap_penalty,
+                dp[i][j - 1] + gap_penalty,
+            )
+
+    i, j = m, s
+    line_to_seg: dict[int, list[int]] = {idx: [] for idx in range(m)}
+    while i > 0 and j > 0:
+        ln_norm = line_norms[i - 1]
+        sg_norm = seg_norms[j - 1]
+        if ln_norm == sg_norm:
+            ratio = 1.0
+        elif ln_norm and sg_norm and (sg_norm in ln_norm or ln_norm in sg_norm):
+            ratio = 0.85
+        elif ln_norm and sg_norm:
+            ratio = difflib.SequenceMatcher(None, ln_norm, sg_norm).ratio()
+        else:
+            ratio = 0.0
+
+        match_score = (ratio - 0.4) * 2.0
+        if math.isclose(dp[i][j], dp[i - 1][j - 1] + match_score, abs_tol=1e-5):
+            if ratio >= 0.35:
+                line_to_seg[i - 1].append(j - 1)
+            i -= 1
+            j -= 1
+        elif math.isclose(dp[i][j], dp[i - 1][j] + gap_penalty, abs_tol=1e-5):
+            i -= 1
+        else:
+            if i > 0 and ratio >= 0.5:
+                line_to_seg[i - 1].append(j - 1)
+            j -= 1
+
+    out_words = []
+    for idx in range(m):
+        words = []
+        for s_idx in sorted(set(line_to_seg[idx])):
+            words.extend(segments[s_idx].words)
+        out_words.append(words)
+
+    return out_words
+
+
 def map_words_to_line_chunks(line_text: str, words: list) -> list[dict]:
-    """Walks line_text and aligned words in order, returning chunk dicts."""
+    """Walks line_text and aligned words in order, returning sanitized chunk dicts."""
     chunks = []
     cursor = 0
     n = len(line_text)
+    prev_end = 0.0
 
     for w in words:
         w_str = w.word.strip()
@@ -434,21 +519,29 @@ def map_words_to_line_chunks(line_text: str, words: list) -> list[dict]:
                     cursor += 2
                     matched += 1
             if matched == 0:
-                cursor = min(n, cursor + max(1, len(w_str)))
+                continue
             last = max(first, cursor - 1)
 
         if chunks and first <= chunks[-1]["last"]:
             first = chunks[-1]["last"] + 1
         if first < n:
             last = min(n - 1, max(first, last))
+            c_start = max(prev_end, start_t)
+            c_end = max(c_start + 0.05, end_t)
+            prev_end = c_end
             chunks.append(
                 {
                     "first": first,
                     "last": last,
-                    "start": round(start_t, 4),
-                    "end": round(max(start_t, end_t), 4),
+                    "start": round(c_start, 4),
+                    "end": round(c_end, 4),
                 }
             )
+
+    if chunks:
+        remainder = line_text[chunks[-1]["last"] + 1 :].rstrip()
+        if remainder and not any(c.isalnum() for c in remainder):
+            chunks[-1]["last"] = len(line_text.rstrip()) - 1
 
     return chunks
 
@@ -558,28 +651,42 @@ def stage3_align(
             else:
                 resolved_lang = detect_audio_language(model, vocals_wav)
 
-        result = model.align(
-            str(vocals_wav),
-            joined_text,
-            language=resolved_lang,
-            original_split=True,
-        )
+        # TODO: Consider evaluating whisper-timestamped or external DTW-based alignment
+        # backends with acoustic voice-activity pre-segmentation for improved phoneme
+        # precision on long instrumental intros and complex backing vocals.
+        try:
+            result = model.align(
+                str(vocals_wav),
+                joined_text,
+                language=resolved_lang,
+                original_split=True,
+                vad=True,
+            )
+        except TypeError:
+            result = model.align(
+                str(vocals_wav),
+                joined_text,
+                language=resolved_lang,
+                original_split=True,
+            )
+        line_word_groups = match_lines_to_segments(clean_lines, result.segments)
         out_lines = []
         for idx, clean_ln in enumerate(clean_lines):
-            if idx < len(result.segments):
-                seg = result.segments[idx]
-                chunks = map_words_to_line_chunks(clean_ln, seg.words)
-            else:
-                chunks = []
+            words = line_word_groups[idx]
+            chunks = map_words_to_line_chunks(clean_ln, words)
             out_lines.append({"text": clean_ln, "chunks": chunks})
     else:
         if resolved_lang is None:
             resolved_lang = detect_audio_language(model, vocals_wav)
 
-        transcribe_kwargs = {"language": resolved_lang}
+        transcribe_kwargs = {"language": resolved_lang, "vad": True}
         if device == "cuda" and total_vram_gb < 6.0:
             transcribe_kwargs["fp16"] = False
-        result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
+        try:
+            result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
+        except TypeError:
+            transcribe_kwargs.pop("vad", None)
+            result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
         transcribed_lines = []
         out_lines = []
         for seg in result.segments:
@@ -875,7 +982,7 @@ def compute_char_timings(
         c_first = max(0, min(n - 1, int(ch_info["first"])))
         c_last = max(c_first, min(n - 1, int(ch_info["last"])))
         t0 = float(ch_info["start"])
-        t1 = max(t0, float(ch_info["end"]))
+        t1 = max(t0 + 0.05, float(ch_info["end"]))
         dur = t1 - t0
 
         weights = [char_mora_weights[i] for i in range(c_first, c_last + 1)]
@@ -886,7 +993,7 @@ def compute_char_timings(
             if total_w > 0:
                 dt = dur * (w / total_w)
             else:
-                dt = 0.0
+                dt = dur / max(1, len(weights))
             times[idx] = (cur_t, cur_t + dt)
             cur_t += dt
 
@@ -1099,8 +1206,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         slot = item["slot"]
         disp_s = item["disp_start"]
         disp_e = item["disp_end"]
-        ts_str = format_ass_time(disp_s)
-        te_str = format_ass_time(disp_e)
+        event_start_sec = int(round(disp_s * 100)) / 100.0
+        event_end_sec = max(event_start_sec + 0.01, int(round(disp_e * 100)) / 100.0)
+        ts_str = format_ass_time(event_start_sec)
+        te_str = format_ass_time(event_end_sec)
 
         unit_w = metrics.text_width(plain, 1.0, 1.0)
         if unit_w > 0:
@@ -1143,22 +1252,40 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         y1_base = int(math.ceil(line_y + line_fs + line_bord + line_shad + 4.0))
 
         n_chars = len(plain)
+        first_non_space = min(
+            (i for i in range(n_chars) if not plain[i].isspace()), default=-1
+        )
+        last_non_space = max(
+            (i for i in range(n_chars) if not plain[i].isspace()), default=-1
+        )
+
+        prev_wipe_end = 0
         for c_idx in range(n_chars):
+            if plain[c_idx].isspace():
+                continue
+
             x_left, x_right = char_x[c_idx]
             clip_x0 = (
-                int(math.floor(x_left - pad_base)) if c_idx == 0 else int(round(x_left))
+                int(math.floor(x_left - pad_base))
+                if c_idx == first_non_space
+                else int(round(x_left))
             )
             clip_x1 = (
                 int(math.ceil(x_right + pad_base))
-                if c_idx == n_chars - 1
+                if c_idx == last_non_space
                 else int(round(x_right))
             )
             if clip_x1 <= clip_x0:
                 continue
 
             ct0, ct1 = char_times[c_idx]
-            rel_t0 = max(0, int(round((ct0 - disp_s) * 1000)))
-            rel_t1 = max(rel_t0 + 1, int(round((ct1 - disp_s) * 1000)))
+            raw_t0 = int(round((ct0 - event_start_sec) * 1000))
+            raw_t1 = int(round((ct1 - event_start_sec) * 1000))
+            rel_t0 = max(prev_wipe_end, max(0, raw_t0))
+            min_dur = 20 if plain[c_idx] not in NON_SUNG_CHARS else 1
+            rel_t1 = max(rel_t0 + min_dur, raw_t1)
+            prev_wipe_end = rel_t1
+
             wipe_tag = (
                 f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fs_tag}{fscx_tag}"
                 f"\\clip({clip_x0},{y0_base},{clip_x0},{y1_base})"
@@ -1217,6 +1344,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             g_dur = max(0.0, g_t1 - g_t0)
 
             cur_rx = r_x
+            prev_ruby_wipe_end = 0
             for m_idx, mora_str in enumerate(morae):
                 mw = metrics.text_width(mora_str, ruby_fs, r_scale_x)
                 mx0 = cur_rx
@@ -1236,8 +1364,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
                 mt0 = g_t0 + g_dur * (m_idx / n_morae)
                 mt1 = g_t0 + g_dur * ((m_idx + 1) / n_morae)
-                rel_mt0 = max(0, int(round((mt0 - disp_s) * 1000)))
-                rel_mt1 = max(rel_mt0 + 1, int(round((mt1 - disp_s) * 1000)))
+                raw_mt0 = int(round((mt0 - event_start_sec) * 1000))
+                raw_mt1 = int(round((mt1 - event_start_sec) * 1000))
+                rel_mt0 = max(prev_ruby_wipe_end, max(0, raw_mt0))
+                rel_mt1 = max(rel_mt0 + 20, raw_mt1)
+                prev_ruby_wipe_end = rel_mt1
 
                 r_wipe_tag = (
                     f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fs_tag}{r_fscx_tag}"
@@ -1924,8 +2055,14 @@ def stage7_render(
     karaoke_ass = workspace / "karaoke.ass"
     output_mp4 = workspace / f"{song_stem}_karaoke.mp4"
 
+    use_guide = guide_vol > 0.0
+    upstream_files = (
+        [inst_wav, guide_wav, vocals_wav, karaoke_ass, bg_path, font_path]
+        if use_guide
+        else [inst_wav, vocals_wav, karaoke_ass, bg_path, font_path]
+    )
     input_fp = compute_fingerprint(
-        [inst_wav, guide_wav, vocals_wav, karaoke_ass, bg_path, font_path],
+        upstream_files,
         {
             "stage": 7,
             "audio_layout": audio_layout,
@@ -1952,65 +2089,114 @@ def stage7_render(
         f"crop=1920:1080,fps=30,ass={ass_esc}:fontsdir={fontsdir_esc}[vout]"
     )
 
-    if audio_layout == "mix":
-        filter_complex = (
-            f"{v_filter};"
-            f"[1:a]volume={inst_vol}[a_inst];"
-            f"[2:a]volume={guide_vol}[a_guide];"
-            f"[3:a]volume={vocal_vol}[a_voc];"
-            f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
-            f"alimiter=limit=0.97[aout]"
-        )
-        map_args = ["-map", "[vout]", "-map", "[aout]"]
-    elif audio_layout == "dual-track":
-        filter_complex = (
-            f"{v_filter};"
-            f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
-            f"[1:a]volume={inst_vol}[a_inst];"
-            f"[2:a]volume={guide_vol}[a_guide];"
-            f"[3:a]volume={vocal_vol}[a_voc];"
-            f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
-            f"alimiter=limit=0.97[a_guide_mix]"
-        )
-        map_args = [
-            "-map",
-            "[vout]",
-            "-map",
-            "[a_off]",
-            "-map",
-            "[a_guide_mix]",
-            "-metadata:s:a:0",
-            "title=Off vocal",
-            "-metadata:s:a:1",
-            "title=Guide",
-            "-disposition:a:0",
-            "default",
+    if use_guide:
+        audio_inputs = [
+            "-i",
+            str(inst_wav),
+            "-i",
+            str(guide_wav),
+            "-i",
+            str(vocals_wav),
         ]
-    elif audio_layout == "split-lr":
-        filter_complex = (
-            f"{v_filter};"
-            f"[1:a]volume={inst_vol}[a_inst];"
-            f"[2:a]volume={guide_vol}[a_guide];"
-            f"[a_inst][a_guide]amix=inputs=2:normalize=0,"
-            f"pan=mono|c0=0.5*c0+0.5*c1[a_left];"
-            f"[3:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
-            f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
-            f"alimiter=limit=0.97[aout]"
-        )
-        map_args = ["-map", "[vout]", "-map", "[aout]"]
+        if audio_layout == "mix":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol}[a_inst];"
+                f"[2:a]volume={guide_vol}[a_guide];"
+                f"[3:a]volume={vocal_vol}[a_voc];"
+                f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
+                f"alimiter=limit=0.97[aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]"]
+        elif audio_layout == "dual-track":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
+                f"[1:a]volume={inst_vol}[a_inst];"
+                f"[2:a]volume={guide_vol}[a_guide];"
+                f"[3:a]volume={vocal_vol}[a_voc];"
+                f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
+                f"alimiter=limit=0.97[a_guide_mix]"
+            )
+            map_args = [
+                "-map",
+                "[vout]",
+                "-map",
+                "[a_off]",
+                "-map",
+                "[a_guide_mix]",
+                "-metadata:s:a:0",
+                "title=Off vocal",
+                "-metadata:s:a:1",
+                "title=Guide",
+                "-disposition:a:0",
+                "default",
+            ]
+        elif audio_layout == "split-lr":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol}[a_inst];"
+                f"[2:a]volume={guide_vol}[a_guide];"
+                f"[a_inst][a_guide]amix=inputs=2:normalize=0,"
+                f"pan=mono|c0=0.5*c0+0.5*c1[a_left];"
+                f"[3:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
+                f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
+                f"alimiter=limit=0.97[aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]"]
+        else:
+            raise ValueError(f"Unsupported audio layout: {audio_layout}")
     else:
-        raise ValueError(f"Unsupported audio layout: {audio_layout}")
+        audio_inputs = ["-i", str(inst_wav), "-i", str(vocals_wav)]
+        if audio_layout == "mix":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol}[a_inst];"
+                f"[2:a]volume={vocal_vol}[a_voc];"
+                f"[a_inst][a_voc]amix=inputs=2:normalize=0,"
+                f"alimiter=limit=0.97[aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]"]
+        elif audio_layout == "dual-track":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
+                f"[1:a]volume={inst_vol}[a_inst];"
+                f"[2:a]volume={vocal_vol}[a_voc];"
+                f"[a_inst][a_voc]amix=inputs=2:normalize=0,"
+                f"alimiter=limit=0.97[a_guide_mix]"
+            )
+            map_args = [
+                "-map",
+                "[vout]",
+                "-map",
+                "[a_off]",
+                "-map",
+                "[a_guide_mix]",
+                "-metadata:s:a:0",
+                "title=Off vocal",
+                "-metadata:s:a:1",
+                "title=Guide",
+                "-disposition:a:0",
+                "default",
+            ]
+        elif audio_layout == "split-lr":
+            filter_complex = (
+                f"{v_filter};"
+                f"[1:a]volume={inst_vol},pan=mono|c0=0.5*c0+0.5*c1[a_left];"
+                f"[2:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
+                f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
+                f"alimiter=limit=0.97[aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]"]
+        else:
+            raise ValueError(f"Unsupported audio layout: {audio_layout}")
 
     cmd = [
         "ffmpeg",
         "-y",
         *bg_in,
-        "-i",
-        str(inst_wav),
-        "-i",
-        str(guide_wav),
-        "-i",
-        str(vocals_wav),
+        *audio_inputs,
         "-filter_complex",
         filter_complex,
         *map_args,
@@ -2195,20 +2381,26 @@ def main():
         check_forced_edits(workspace, force_idx, manifest)
 
     t_pipeline_start = time.perf_counter()
-    stage_times: list[tuple[str, float, bool]] = []
+    stage_times: list[tuple[str, float, str]] = []
 
-    def run_stage(idx: int, title: str, fn):
+    def run_stage(idx: int, title: str, fn, skip_reason: str | None = None):
         elapsed_total = time.perf_counter() - t_pipeline_start
         print(f"\n[{idx}/7] {title}  (total {format_duration(elapsed_total)})")
+        if skip_reason is not None:
+            print(f"  skipped ({skip_reason})")
+            stage_times.append((f"[{idx}/7] {title}", 0.0, f"skipped ({skip_reason})"))
+            return
         t0 = time.perf_counter()
         forced = force_idx is not None and (idx - 1) >= force_idx
         ran = fn(forced)
         dt = time.perf_counter() - t0
         if ran:
-            print(f"  done in {format_duration(dt)}")
+            status = format_duration(dt)
+            print(f"  done in {status}")
         else:
-            print("  skipped (cached)")
-        stage_times.append((f"[{idx}/7] {title}", dt, ran))
+            status = "skipped (cached)"
+            print(f"  {status}")
+        stage_times.append((f"[{idx}/7] {title}", dt, status))
 
     run_stage(
         1,
@@ -2238,6 +2430,11 @@ def main():
         5,
         "Extracting and synthesizing guide melody",
         lambda f: stage5_guide(workspace, args.guide_timbre, manifest, f),
+        skip_reason=(
+            "guide muted"
+            if args.guide_vol == 0.0 and force_idx != STAGES.index("guide")
+            else None
+        ),
     )
 
     bg_holder: list[Path] = []
@@ -2276,8 +2473,7 @@ def main():
 
     total_time = time.perf_counter() - t_pipeline_start
     print("\n--- Pipeline Summary ---")
-    for label, dt, ran in stage_times:
-        status = format_duration(dt) if ran else "skipped (cached)"
+    for label, _dt, status in stage_times:
         print(f"  {label:<45} {status}")
     print(f"  {'Total':<45} {format_duration(total_time)}")
     print(f"  Output: {out_holder[0]}")
