@@ -991,7 +991,7 @@ Style: BaseSung,{metrics.family_name},{int(max_base_fs)},{sung_fill},{sung_fill}
 Style: RubyUnsung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
 Style: RubySung,{metrics.family_name},{int(max_base_fs * ruby_ratio)},{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,3,2,7,0,0,0,1
 Style: BreakTimer,{metrics.family_name},54,{unsung_fill},{unsung_fill},{unsung_out},{shad_col},0,0,0,0,100,100,0,0,1,4,2,5,0,0,0,1
-Style: LeadInDot,{metrics.family_name},90,{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,5,3,5,0,0,0,1
+Style: LeadInDot,{metrics.family_name},64,{sung_fill},{sung_fill},{sung_out},{shad_col},0,0,0,0,100,100,0,0,1,4,2,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1019,50 +1019,77 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     # Compute slot assignment and display windows
     n_lines = len(parsed_lines)
-    break_threshold = 8.0
-    slot_idx = 0
-    for i, item in enumerate(parsed_lines):
-        if i == 0 or (item["start"] - parsed_lines[i - 1]["end"]) > break_threshold:
-            slot_idx = 0
-        else:
-            slot_idx = 1 - slot_idx
-        item["slot"] = slot_idx
+    stanza_reset_gap = 2.5
+    lead_in_gap = 5.0
+    slot_reuse_hold = 0.3
+    slot_reuse_blank = 0.35
+    stanza_clear_blank = 0.4
+    max_preview_lead = 2.5
 
+    slot_idx = 0
     for i, item in enumerate(parsed_lines):
         gap_before = (
             (item["start"] - parsed_lines[i - 1]["end"]) if i > 0 else item["start"]
         )
-        is_break = gap_before > break_threshold
+        if i == 0 or gap_before >= stanza_reset_gap:
+            slot_idx = 0
+            item["is_stanza_start"] = True
+        else:
+            slot_idx = 1 - slot_idx
+            item["is_stanza_start"] = False
+        item["slot"] = slot_idx
+        item["gap_before"] = gap_before
+        item["is_lead_in"] = (i == 0 and item["start"] >= 2.0) or (
+            i > 0 and gap_before >= lead_in_gap
+        )
 
-        is_pair_start = i == 0 or is_break
-        if is_pair_start:
-            disp_start = max(0.0, item["start"] - 3.0)
-            if i > 0:
-                disp_start = max(disp_start, parsed_lines[i - 1]["end"] + 0.5)
-        elif i == 1 or (
-            i >= 2
-            and parsed_lines[i - 1]["start"] - parsed_lines[i - 2]["end"]
-            > break_threshold
+    # Determine disp_end first so disp_start can leave a visible blank gap after it
+    for i, item in enumerate(parsed_lines):
+        disp_end = item["end"] + 0.5
+        has_same_slot_in_stanza = (
+            i + 2 < n_lines
+            and not parsed_lines[i + 1]["is_stanza_start"]
+            and not parsed_lines[i + 2]["is_stanza_start"]
+            and parsed_lines[i + 2]["slot"] == item["slot"]
+        )
+        if has_same_slot_in_stanza:
+            next_same = parsed_lines[i + 2]
+            avail = max(0.0, next_same["start"] - item["end"])
+            hold = min(slot_reuse_hold, avail * 0.4)
+            disp_end = min(disp_end, item["end"] + hold)
+        elif i + 1 < n_lines and parsed_lines[i + 1]["is_stanza_start"]:
+            next_stanza = parsed_lines[i + 1]
+            avail = max(0.0, next_stanza["start"] - item["end"])
+            hold = min(0.5, avail * 0.35)
+            disp_end = min(disp_end, item["end"] + hold)
+
+        item["disp_end"] = max(item["end"], disp_end)
+
+    # Ensure the earlier slot of a finishing stanza never outlives the stanza's final line
+    for i, item in enumerate(parsed_lines):
+        if (
+            i + 1 < n_lines
+            and not parsed_lines[i + 1]["is_stanza_start"]
+            and (i + 2 == n_lines or parsed_lines[i + 2]["is_stanza_start"])
         ):
+            item["disp_end"] = min(item["disp_end"], parsed_lines[i + 1]["disp_end"])
+
+    for i, item in enumerate(parsed_lines):
+        if item["is_stanza_start"]:
+            lead = 3.0 if item["is_lead_in"] else max_preview_lead
+            disp_start = max(0.0, item["start"] - lead)
+            if i > 0:
+                prev_clear = parsed_lines[i - 1]["disp_end"] + stanza_clear_blank
+                disp_start = min(item["start"], max(disp_start, prev_clear))
+        elif parsed_lines[i - 1]["is_stanza_start"]:
             disp_start = parsed_lines[i - 1]["disp_start"]
         else:
             prev_same_slot = parsed_lines[i - 2]
-            disp_start = min(item["start"], prev_same_slot["end"] + 0.3)
-
-        disp_end = item["end"] + 0.5
-        if (
-            i + 1 < n_lines
-            and (parsed_lines[i + 1]["start"] - item["end"]) <= break_threshold
-            and i + 2 < n_lines
-            and parsed_lines[i + 2]["slot"] == item["slot"]
-        ):
-            next_same = parsed_lines[i + 2]
-            needed = min(next_same["start"], item["end"] + 0.3)
-            disp_end = min(disp_end, needed)
+            earliest = prev_same_slot["disp_end"] + slot_reuse_blank
+            desired = max(earliest, item["start"] - max_preview_lead)
+            disp_start = min(item["start"], desired)
 
         item["disp_start"] = disp_start
-        item["disp_end"] = max(item["end"], disp_end)
-        item["is_break_entry"] = is_break or (i == 0)
 
     events = []
     for item in parsed_lines:
@@ -1150,6 +1177,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         y1_ruby = int(math.ceil(ruby_y + ruby_fs + ruby_bord + ruby_shad + 3.0))
         pad_ruby = (ruby_bord + ruby_shad) * scale_x + 2.0
 
+        has_ruby = any(seg["type"] == "ruby" and seg["ruby"] for seg in segments)
+        item["line_x"] = line_x
+        item["top_y"] = ruby_y if has_ruby else line_y
+
         for seg in segments:
             if seg["type"] != "ruby" or not seg["ruby"]:
                 continue
@@ -1224,7 +1255,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lead_in_start = item["start"] - 3.0
 
         if gap_duration > 10.0:
-            break_disp_start = max(0.0, prev_end + 0.5)
+            break_disp_start = (
+                parsed_lines[i - 1]["disp_end"] + stanza_clear_blank if i > 0 else 0.0
+            )
             break_disp_end = lead_in_start
             if break_disp_end > break_disp_start:
                 # Render second-by-second countdown for the instrumental break.
@@ -1245,21 +1278,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     )
                     t = next_t
 
-        if item.get("is_break_entry", False) and item["start"] >= 2.0:
-            # 3-2-1 countdown dots in the 3 seconds preceding vocal start
-            # 3 dots: at x = 860, 960, 1060, y = 540
-            # Dot 1 appears at start - 3.0 (or max(0, start-3.0))
-            # Dot 2 appears at start - 2.0
-            # Dot 3 appears at start - 1.0
-            # All disappear at start
-            dot_xs = [860, 960, 1060]
-            for dot_idx, x_pos in enumerate(dot_xs):
+        if item.get("is_lead_in", False) and item["start"] >= 2.0:
+            # 3-2-1 countdown dots above the left start of the upcoming line
+            dot_y = item["top_y"] - 36.0
+            base_x = item["line_x"] + 25.0
+            for dot_idx in range(3):
+                x_pos = base_x + dot_idx * 65.0
                 d_t0 = max(0.0, item["start"] - (3.0 - dot_idx))
                 d_t1 = item["start"]
                 if d_t1 > d_t0:
                     t0_str = format_ass_time(d_t0)
                     t1_str = format_ass_time(d_t1)
-                    pos_tag = rf"{{\pos({x_pos},540)}}"
+                    pos_tag = rf"{{\pos({x_pos:.1f},{dot_y:.1f})}}"
                     events.append(
                         f"Dialogue: 0,{t0_str},{t1_str},LeadInDot,,0,0,0,,{pos_tag}●"
                     )
