@@ -400,176 +400,144 @@ def strip_ruby_overrides(line: str) -> str:
     return re.sub(r"\{([^|{}]+)\|([^{}]+)\}", r"\1", line)
 
 
-def clean_for_match(text: str) -> str:
-    """Normalizes text for fuzzy matching by removing punctuation and whitespace."""
-    return re.sub(r"[\W_]+", "", text.lower())
+def normalized_characters(text):
+    for index, char in enumerate(text):
+        if char.isalnum():
+            lower = char.lower()
+            yield (lower if len(lower) == 1 else char), index
 
 
-def match_lines_to_segments(clean_lines: list[str], segments: list) -> list[list]:
-    """Matches user lyric lines to Whisper segments using DP alignment.
+def map_alignment_chunks(lines, segments):
+    """Map whole timed tokens onto lyric characters, ignoring segment boundaries."""
+    positions = []
+    reference = []
+    for line_index, line in enumerate(lines):
+        for char, index in normalized_characters(line):
+            positions.append((line_index, index))
+            reference.append(char)
 
-    Handles dropped lines, inserted segments, and line splits without cascading
-    off-by-one desynchronization. Returns a list of word lists, one per input line.
-    """
-    m = len(clean_lines)
-    s = len(segments)
-    if m == 0 or s == 0:
-        return [[] for _ in clean_lines]
-
-    line_norms = [clean_for_match(ln) for ln in clean_lines]
-    seg_norms = [clean_for_match(getattr(seg, "text", "")) for seg in segments]
-
-    gap_penalty = -0.3
-    dp = [[0.0] * (s + 1) for _ in range(m + 1)]
-    for i in range(1, m + 1):
-        dp[i][0] = i * gap_penalty
-    for j in range(1, s + 1):
-        dp[0][j] = j * gap_penalty
-
-    for i in range(1, m + 1):
-        ln_norm = line_norms[i - 1]
-        for j in range(1, s + 1):
-            sg_norm = seg_norms[j - 1]
-            if ln_norm == sg_norm:
-                ratio = 1.0
-            elif ln_norm and sg_norm and (sg_norm in ln_norm or ln_norm in sg_norm):
-                ratio = 0.85
-            elif ln_norm and sg_norm:
-                ratio = difflib.SequenceMatcher(None, ln_norm, sg_norm).ratio()
-            else:
-                ratio = 0.0
-
-            match_score = (ratio - 0.4) * 2.0
-            dp[i][j] = max(
-                dp[i - 1][j - 1] + match_score,
-                dp[i - 1][j] + gap_penalty,
-                dp[i][j - 1] + gap_penalty,
+    words = [word for segment in segments for word in (segment.words or ())]
+    tokens = [
+        "".join(char for char, _ in normalized_characters(word.word)) for word in words
+    ]
+    heard = "".join(tokens)
+    expected = "".join(reference)
+    if heard == expected:
+        matched_positions = list(range(len(heard)))
+    else:
+        matched_positions = [None] * len(heard)
+        matcher = difflib.SequenceMatcher(None, heard, expected, autojunk=False)
+        for heard_start, ref_start, size in matcher.get_matching_blocks():
+            matched_positions[heard_start : heard_start + size] = range(
+                ref_start, ref_start + size
             )
 
-    i, j = m, s
-    line_to_seg: dict[int, list[int]] = {idx: [] for idx in range(m)}
-    while i > 0 and j > 0:
-        ln_norm = line_norms[i - 1]
-        sg_norm = seg_norms[j - 1]
-        if ln_norm == sg_norm:
-            ratio = 1.0
-        elif ln_norm and sg_norm and (sg_norm in ln_norm or ln_norm in sg_norm):
-            ratio = 0.85
-        elif ln_norm and sg_norm:
-            ratio = difflib.SequenceMatcher(None, ln_norm, sg_norm).ratio()
-        else:
-            ratio = 0.0
-
-        match_score = (ratio - 0.4) * 2.0
-        if math.isclose(dp[i][j], dp[i - 1][j - 1] + match_score, abs_tol=1e-5):
-            if ratio >= 0.35:
-                line_to_seg[i - 1].append(j - 1)
-            i -= 1
-            j -= 1
-        elif math.isclose(dp[i][j], dp[i - 1][j] + gap_penalty, abs_tol=1e-5):
-            i -= 1
-        else:
-            if i > 0 and ratio >= 0.5:
-                line_to_seg[i - 1].append(j - 1)
-            j -= 1
-
-    out_words = []
-    for idx in range(m):
-        words = []
-        for s_idx in sorted(set(line_to_seg[idx])):
-            words.extend(segments[s_idx].words)
-        out_words.append(words)
-
-    return out_words
-
-
-def map_words_to_line_chunks(line_text: str, words: list) -> list[dict]:
-    """Walks line_text and aligned words in order, returning sanitized chunk dicts."""
-    chunks = []
-    cursor = 0
-    n = len(line_text)
-    prev_end = 0.0
-
-    for w in words:
-        w_str = w.word.strip()
-        if not w_str:
+    line_chunks = [[] for _ in lines]
+    offset = 0
+    for word, token in zip(words, tokens):
+        matched = matched_positions[offset : offset + len(token)]
+        offset += len(token)
+        # A shared suffix of a different token is insufficient to time it.
+        if (
+            not matched
+            or matched[0] is None
+            or matched != list(range(matched[0], matched[0] + len(token)))
+        ):
             continue
-        start_t = float(w.start)
-        end_t = float(w.end)
+        if word.start is None or word.end is None:
+            continue
+        start, end = float(word.start), float(word.end)
+        if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+            continue
 
-        while cursor < n and line_text[cursor].isspace():
-            cursor += 1
-        if cursor >= n:
-            break
+        # A token can straddle a display line. Split only that token's interval.
+        first = 0
+        while first < len(matched):
+            line_index, char_start = positions[matched[first]]
+            stop = first + 1
+            while stop < len(matched) and positions[matched[stop]][0] == line_index:
+                stop += 1
+            chunks = line_chunks[line_index]
+            chunk_start = start + (end - start) * first / len(matched)
+            chunk_end = start + (end - start) * stop / len(matched)
+            if chunks:
+                chunk_start = max(chunk_start, chunks[-1]["end"])
+            if chunk_start < chunk_end:
+                chunks.append(
+                    {
+                        "first": char_start,
+                        "last": positions[matched[stop - 1]][1],
+                        "start": chunk_start,
+                        "end": chunk_end,
+                    }
+                )
+            first = stop
 
-        idx = line_text.find(w_str, cursor)
-        if idx != -1 and idx - cursor <= 8:
-            first = idx
-            last = idx + len(w_str) - 1
-            cursor = last + 1
-        else:
-            # Byte-level BPE or minor mismatch: match characters greedily
-            first = cursor
-            matched = 0
-            for ch in w_str:
-                if cursor < n and line_text[cursor] == ch:
-                    cursor += 1
-                    matched += 1
-                elif cursor + 1 < n and line_text[cursor + 1] == ch:
-                    cursor += 2
-                    matched += 1
-            if matched == 0:
-                continue
-            last = max(first, cursor - 1)
-
-        if chunks and first <= chunks[-1]["last"]:
-            first = chunks[-1]["last"] + 1
-        if first < n:
-            last = min(n - 1, max(first, last))
-            c_start = max(prev_end, start_t)
-            c_end = max(c_start + 0.05, end_t)
-            prev_end = c_end
-            chunks.append(
-                {
-                    "first": first,
-                    "last": last,
-                    "start": round(c_start, 4),
-                    "end": round(c_end, 4),
-                }
-            )
-
-    if chunks:
-        remainder = line_text[chunks[-1]["last"] + 1 :].rstrip()
-        if remainder and not any(c.isalnum() for c in remainder):
-            chunks[-1]["last"] = len(line_text.rstrip()) - 1
-
-    return chunks
+    return [
+        {"text": line, "chunks": chunks} for line, chunks in zip(lines, line_chunks)
+    ]
 
 
-def has_japanese_text(text: str) -> bool:
-    """Checks if text contains Hiragana, Katakana, or CJK Kanji."""
-    return any(
-        (0x3040 <= ord(c) <= 0x309F)
-        or (0x30A0 <= ord(c) <= 0x30FF)
-        or (0x4E00 <= ord(c) <= 0x9FFF)
-        for c in text
-    )
+def vocal_activity(samples, sample_rate):
+    frame_size = max(1, round(sample_rate * 0.02))
+    frame_seconds = frame_size / sample_rate
+    frames = samples[: len(samples) // frame_size * frame_size].reshape(-1, frame_size)
+    if not len(frames):
+        return np.empty(0, dtype=bool), frame_seconds
+    rms = np.sqrt(np.mean(frames**2, axis=1))
+    peak = float(rms.max())
+    floor = min(peak * 0.10, float(np.percentile(rms, 20)) * 3)
+    return rms > max(peak * 0.02, floor), frame_seconds
 
 
 def detect_audio_language(model, vocals_wav: Path) -> str:
-    """Detects spoken language from vocal stem audio using Whisper."""
     import whisper
 
+    if not model.is_multilingual:
+        return "en"
+
     audio = whisper.load_audio(str(vocals_wav))
-    mel = whisper.log_mel_spectrogram(audio, model.dims.n_mels)
-    mel_seg = (
-        whisper.pad_or_trim(mel, 3000)
-        .to(model.device)
-        .to(next(model.parameters()).dtype)
-    )
-    _, probs = model.detect_language(mel_seg)
-    detected = max(probs, key=probs.get)
-    print(f"  Detected audio language: {detected} (confidence: {probs[detected]:.1%})")
+    sample_rate = whisper.audio.SAMPLE_RATE
+    active, frame_seconds = vocal_activity(audio, sample_rate)
+    if not active.any():
+        raise ValueError(
+            "No vocal activity for language detection. Check vocals.wav or set --language."
+        )
+
+    # Sample throughout the song so an intro or a single chorus can't cast every vote.
+    sample_count = min(5, max(1, round(len(active) * frame_seconds / 6)))
+    window_frames = round(12 / frame_seconds)
+    frame_samples = round(frame_seconds * sample_rate)
+    totals = {}
+    votes = []
+    for region in np.array_split(np.arange(len(active)), sample_count):
+        region_activity = active[region]
+        window = min(window_frames, len(region))
+        counts = np.convolve(
+            region_activity.astype(int), np.ones(window, dtype=int), mode="valid"
+        )
+        best = int(counts.argmax())
+        if counts[best] * frame_seconds < 0.5:
+            continue
+        first = int(region[best])
+        audio_clip = audio[first * frame_samples : (first + window) * frame_samples]
+        mel = whisper.log_mel_spectrogram(
+            whisper.pad_or_trim(audio_clip), model.dims.n_mels
+        ).to(device=model.device, dtype=next(model.parameters()).dtype)
+        _, probs = model.detect_language(mel)
+        for lang, probability in probs.items():
+            totals[lang] = totals.get(lang, 0.0) + probability
+        votes.append(f"{first * frame_seconds:.1f}s {max(probs, key=probs.get)}")
+
+    if not totals:
+        raise ValueError(
+            "Too little vocal activity for language detection. Set --language explicitly."
+        )
+    detected = max(totals, key=totals.get)
+    leading = sorted(totals, key=totals.get, reverse=True)[:3]
+    scores = ", ".join(f"{lang} {totals[lang] / len(votes):.0%}" for lang in leading)
+    print(f"  Detected audio language: {detected} ({scores})")
+    print("  Language by clip: " + ", ".join(votes))
     return detected
 
 
@@ -592,7 +560,7 @@ def stage3_align(
         or sha256_file(lyrics_txt) != manifest[lyrics_txt.name].get("output_fp")
     )
 
-    if has_user_lyrics or (lyrics_txt.exists() and not force):
+    if has_user_lyrics:
         upstream = [vocals_wav, lyrics_txt]
         artifacts = [alignment_json]
     else:
@@ -600,7 +568,13 @@ def stage3_align(
         artifacts = [lyrics_txt, alignment_json]
 
     input_fp = compute_fingerprint(
-        upstream, {"stage": 3, "whisper_model": whisper_model, "language": language}
+        upstream,
+        {
+            "stage": 3,
+            "version": 3,
+            "whisper_model": whisper_model,
+            "language": language,
+        },
     )
     should_run, kept = check_stage_status(artifacts, input_fp, manifest, force)
     if not should_run:
@@ -636,7 +610,10 @@ def stage3_align(
         language.lower() if (language and language.lower() != "auto") else None
     )
 
-    if lyrics_txt.exists() and (has_user_lyrics or not force):
+    if resolved_lang is None:
+        resolved_lang = detect_audio_language(model, vocals_wav)
+
+    if has_user_lyrics:
         raw_lines = [
             ln.strip()
             for ln in lyrics_txt.read_text(encoding="utf-8").splitlines()
@@ -645,64 +622,45 @@ def stage3_align(
         clean_lines = [strip_ruby_overrides(ln) for ln in raw_lines]
         joined_text = "\n".join(clean_lines)
 
-        if resolved_lang is None:
-            if has_japanese_text(joined_text):
-                resolved_lang = "ja"
-            else:
-                resolved_lang = detect_audio_language(model, vocals_wav)
+        if not any(char.isalnum() for char in joined_text):
+            raise ValueError("The supplied lyrics file contains no lyric text.")
 
-        # TODO: Consider evaluating whisper-timestamped or external DTW-based alignment
-        # backends with acoustic voice-activity pre-segmentation for improved phoneme
-        # precision on long instrumental intros and complex backing vocals.
-        try:
-            result = model.align(
-                str(vocals_wav),
-                joined_text,
-                language=resolved_lang,
-                original_split=True,
-                vad=True,
+        result = model.align(
+            str(vocals_wav),
+            joined_text,
+            language=resolved_lang,
+            original_split=True,
+            vad=True,
+        )
+        if result is None:
+            raise ValueError(
+                "Whisper could not align the supplied lyrics to vocals.wav."
             )
-        except TypeError:
-            result = model.align(
-                str(vocals_wav),
-                joined_text,
-                language=resolved_lang,
-                original_split=True,
-            )
-        line_word_groups = match_lines_to_segments(clean_lines, result.segments)
-        out_lines = []
-        for idx, clean_ln in enumerate(clean_lines):
-            words = line_word_groups[idx]
-            chunks = map_words_to_line_chunks(clean_ln, words)
-            out_lines.append({"text": clean_ln, "chunks": chunks})
     else:
-        if resolved_lang is None:
-            resolved_lang = detect_audio_language(model, vocals_wav)
-
-        transcribe_kwargs = {"language": resolved_lang, "vad": True}
+        transcribe_kwargs = {"language": resolved_lang, "stream": False}
         if device == "cuda" and total_vram_gb < 6.0:
             transcribe_kwargs["fp16"] = False
-        try:
-            result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
-        except TypeError:
-            transcribe_kwargs.pop("vad", None)
-            result = model.transcribe(str(vocals_wav), **transcribe_kwargs)
-        transcribed_lines = []
-        out_lines = []
-        for seg in result.segments:
-            text = seg.text.strip()
-            if not text:
-                continue
-            transcribed_lines.append(text)
-            chunks = map_words_to_line_chunks(text, seg.words)
-            out_lines.append({"text": text, "chunks": chunks})
+        # A speech VAD can classify sung phrases as silence even in an isolated stem.
+        result = model.transcribe(str(vocals_wav), vad=False, **transcribe_kwargs)
+        if not result.segments:
+            print(
+                "  [warning] No lyrics transcribed. Retrying with speech activity detection."
+            )
+            result = model.transcribe(str(vocals_wav), vad=True, **transcribe_kwargs)
+        clean_lines = [seg.text.strip() for seg in result.segments if seg.text.strip()]
+        if not any(char.isalnum() for line in clean_lines for char in line):
+            raise ValueError(
+                "Whisper returned no lyrics. Check vocals.wav or supply lyrics with --lyrics."
+            )
+        if lyrics_txt not in kept:
+            lyrics_txt.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
 
-        lyrics_txt.write_text("\n".join(transcribed_lines) + "\n", encoding="utf-8")
-
-    alignment_json.write_text(
-        json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    out_lines = map_alignment_chunks(clean_lines, result.segments)
+    if alignment_json not in kept:
+        alignment_json.write_text(
+            json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     del model
     gc.collect()
     if torch.cuda.is_available():
@@ -977,42 +935,126 @@ def compute_char_timings(
                     char_mora_weights[idx] = 1.0
                     idx += 1
 
-    times: list[tuple[float, float] | None] = [None] * n
-    for ch_info in chunks:
-        c_first = max(0, min(n - 1, int(ch_info["first"])))
-        c_last = max(c_first, min(n - 1, int(ch_info["last"])))
-        t0 = float(ch_info["start"])
-        t1 = max(t0 + 0.05, float(ch_info["end"]))
-        dur = t1 - t0
+    times = [(0.0, 0.0)] * n
 
-        weights = [char_mora_weights[i] for i in range(c_first, c_last + 1)]
-        total_w = sum(weights)
-        cur_t = t0
-        for offset, w in enumerate(weights):
-            idx = c_first + offset
-            if total_w > 0:
-                dt = dur * (w / total_w)
-            else:
-                dt = dur / max(1, len(weights))
-            times[idx] = (cur_t, cur_t + dt)
-            cur_t += dt
+    def distribute(first, stop, start, end):
+        weights = char_mora_weights[first:stop]
+        total = sum(weights)
+        cursor = start
+        for index, weight in enumerate(weights, first):
+            duration = (end - start) * weight / total if total else 0.0
+            times[index] = (cursor, cursor + duration)
+            cursor += duration
 
-    # Fill any unaligned characters by interpolating between neighboring chunks
-    last_t = chunks[0]["start"] if chunks else 0.0
-    for i in range(n):
-        if times[i] is not None:
-            last_t = times[i][1]
-        else:
-            next_t = last_t
-            for j in range(i + 1, n):
-                if times[j] is not None:
-                    next_t = times[j][0]
-                    break
-            times[i] = (
-                (last_t, last_t) if char_mora_weights[i] == 0 else (last_t, next_t)
+    next_char = 0
+    previous_end = chunks[0]["start"] if chunks else 0.0
+    for chunk in chunks:
+        distribute(next_char, chunk["first"], previous_end, chunk["start"])
+        next_char = chunk["last"] + 1
+        distribute(chunk["first"], next_char, chunk["start"], chunk["end"])
+        previous_end = chunk["end"]
+    distribute(next_char, n, previous_end, previous_end)
+    return times
+
+
+def validate_alignment(align_data, display_lines, duration):
+    if not isinstance(align_data, list):
+        raise ValueError("alignment.json must contain a list of lyric lines.")
+
+    untimed = []
+    partial = []
+    for index, (line, plain) in enumerate(zip(align_data, display_lines), 1):
+        if not isinstance(line, dict) or not isinstance(line.get("chunks"), list):
+            raise ValueError(f"Invalid lyric line {index} in alignment.json.")
+        if line.get("text") != plain:
+            raise ValueError(
+                f"Line {index} differs between alignment.json and lyrics_ruby.txt: "
+                f"{line.get('text')!r} vs {plain!r}. Regenerate the stale file."
+            )
+        previous_char = -1
+        previous_end = 0.0
+        covered = set()
+        for chunk in line["chunks"]:
+            if not isinstance(chunk, dict):
+                raise ValueError(
+                    f"Invalid timing chunk in alignment.json line {index}."
+                )
+            first, last = chunk.get("first"), chunk.get("last")
+            start, end = chunk.get("start"), chunk.get("end")
+            if not (
+                type(first) is int
+                and type(last) is int
+                and previous_char < first <= last < len(plain)
+                and type(start) in (int, float)
+                and type(end) in (int, float)
+                and previous_end <= start < end <= duration + 0.01
+            ):
+                raise ValueError(
+                    f"Invalid timing in alignment.json line {index}: {plain!r}, {chunk!r}"
+                )
+            covered.update(range(first, last + 1))
+            previous_char, previous_end = last, end
+
+        missing = sum(i not in covered for _, i in normalized_characters(plain))
+        if missing:
+            (partial if covered else untimed).append(str(index))
+
+    if len(align_data) != len(display_lines):
+        raise ValueError(
+            "alignment.json and lyrics_ruby.txt have different line counts. "
+            f"The first unpaired line is {min(len(align_data), len(display_lines)) + 1}."
+        )
+    if not any(line["chunks"] for line in align_data):
+        raise ValueError(
+            "No lyrics have usable timings. Check vocals.wav and the lyric text."
+        )
+    for label, affected in (
+        ("Untimed lyric lines omitted from subtitles", untimed),
+        ("Partly timed lyric lines", partial),
+    ):
+        if affected:
+            print(
+                f"  [warning] {label} ({len(affected)}), line numbers: "
+                + ", ".join(affected[:5])
             )
 
-    return [t if t is not None else (0.0, 0.0) for t in times]
+
+def report_vocal_timing(align_data, samples, sample_rate):
+    active, frame_seconds = vocal_activity(samples, sample_rate)
+    uncovered = active.copy()
+    silent_starts = []
+    repeated_durations = []
+    for line in align_data:
+        chunks = line["chunks"]
+        for chunk in chunks:
+            start, end = chunk["start"], chunk["end"]
+            first = max(0, math.floor((start - 0.12) / frame_seconds))
+            last = math.ceil((end + 0.12) / frame_seconds)
+            uncovered[first:last] = False
+            if not active[first : math.ceil((start + 0.12) / frame_seconds)].any():
+                silent_starts.append(f"{start:.2f}s")
+        durations = [chunk["end"] - chunk["start"] for chunk in chunks]
+        for first in range(len(durations) - 4):
+            run = durations[first : first + 5]
+            if max(run) - min(run) <= 0.01:
+                repeated_durations.append(f"{chunks[first]['start']:.2f}s")
+                break
+
+    # Group brief pauses between syllables, and keep only sustained uncovered activity.
+    vocal_frames = np.flatnonzero(uncovered)
+    breaks = np.flatnonzero(np.diff(vocal_frames) * frame_seconds > 0.12) + 1
+    vocal_gaps = [
+        f"{run[0] * frame_seconds:.2f}-{(run[-1] + 1) * frame_seconds:.2f}s"
+        for run in np.split(vocal_frames, breaks)
+        if len(run) * frame_seconds >= 0.5
+    ]
+    for label, times in (
+        ("Lyric chunks starting near vocal silence", silent_starts),
+        ("Lines with repeated equal-length timings", repeated_durations),
+        ("Vocal activity outside lyric timing", vocal_gaps),
+    ):
+        if times:
+            print(f"  [warning] {label} ({len(times)}): " + ", ".join(times[:5]))
 
 
 def stage4_ass(
@@ -1046,20 +1088,28 @@ def stage4_ass(
         )
 
     ass_input_fp = compute_fingerprint(
-        [lyrics_ruby_txt, alignment_json, font_path],
-        {"stage": "4_ass", "style": style_preset},
+        [lyrics_ruby_txt, alignment_json, workspace / "vocals.wav", font_path],
+        {"stage": "4_ass", "version": 2, "style": style_preset},
     )
     run_ass, kept_ass = check_stage_status([karaoke_ass], ass_input_fp, manifest, force)
     if not run_ass:
         return run_ruby
 
-    metrics = FontMetrics(font_path)
-    align_data = json.loads(alignment_json.read_text(encoding="utf-8")).get("lines", [])
+    align_data = json.loads(alignment_json.read_text(encoding="utf-8")).get("lines")
     ruby_lines = [
         ln.strip()
         for ln in lyrics_ruby_txt.read_text(encoding="utf-8").splitlines()
         if ln.strip()
     ]
+    display_lines = [parse_ruby_line_segments(line) for line in ruby_lines]
+    samples, sample_rate = sf.read(
+        workspace / "vocals.wav", dtype="float32", always_2d=True
+    )
+    validate_alignment(
+        align_data, [plain for plain, _ in display_lines], len(samples) / sample_rate
+    )
+    report_vocal_timing(align_data, samples.mean(axis=1), sample_rate)
+    metrics = FontMetrics(font_path)
 
     if style_preset == "joysound":
         unsung_fill = "&H00FFFFFF"
@@ -1105,9 +1155,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
     parsed_lines = []
-    for idx, r_line in enumerate(ruby_lines):
-        plain_text, segments = parse_ruby_line_segments(r_line)
-        chunks = align_data[idx].get("chunks", []) if idx < len(align_data) else []
+    for (plain_text, segments), alignment in zip(display_lines, align_data):
+        chunks = alignment["chunks"]
         if not chunks:
             continue
         char_times = compute_char_timings(plain_text, segments, chunks)
@@ -1259,7 +1308,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             (i for i in range(n_chars) if not plain[i].isspace()), default=-1
         )
 
-        prev_wipe_end = 0
         for c_idx in range(n_chars):
             if plain[c_idx].isspace():
                 continue
@@ -1281,10 +1329,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ct0, ct1 = char_times[c_idx]
             raw_t0 = int(round((ct0 - event_start_sec) * 1000))
             raw_t1 = int(round((ct1 - event_start_sec) * 1000))
-            rel_t0 = max(prev_wipe_end, max(0, raw_t0))
-            min_dur = 20 if plain[c_idx] not in NON_SUNG_CHARS else 1
-            rel_t1 = max(rel_t0 + min_dur, raw_t1)
-            prev_wipe_end = rel_t1
+            rel_t0 = max(0, raw_t0)
+            rel_t1 = max(rel_t0 + 1, raw_t1)
 
             wipe_tag = (
                 f"{{\\an7\\pos({line_x:.2f},{line_y:.2f}){fs_tag}{fscx_tag}"
@@ -1344,7 +1390,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             g_dur = max(0.0, g_t1 - g_t0)
 
             cur_rx = r_x
-            prev_ruby_wipe_end = 0
             for m_idx, mora_str in enumerate(morae):
                 mw = metrics.text_width(mora_str, ruby_fs, r_scale_x)
                 mx0 = cur_rx
@@ -1366,9 +1411,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 mt1 = g_t0 + g_dur * ((m_idx + 1) / n_morae)
                 raw_mt0 = int(round((mt0 - event_start_sec) * 1000))
                 raw_mt1 = int(round((mt1 - event_start_sec) * 1000))
-                rel_mt0 = max(prev_ruby_wipe_end, max(0, raw_mt0))
-                rel_mt1 = max(rel_mt0 + 20, raw_mt1)
-                prev_ruby_wipe_end = rel_mt1
+                rel_mt0 = max(0, raw_mt0)
+                rel_mt1 = max(rel_mt0 + 1, raw_mt1)
 
                 r_wipe_tag = (
                     f"{{\\an7\\pos({r_x:.2f},{ruby_y:.2f}){r_fs_tag}{r_fscx_tag}"

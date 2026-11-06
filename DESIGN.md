@@ -111,7 +111,7 @@ Input song (any FFmpeg-readable audio) [+ optional lyrics.txt]
   │     ├── vocals.wav
   │     └── instrumental.wav
   │
-  ├── [Stage 3] Lyrics and alignment (stable-ts / Whisper, language="ja")
+  ├── [Stage 3] Lyrics and alignment (stable-ts / Whisper)
   │     ├── No lyrics: transcribe vocals.wav → lyrics.txt + alignment.json
   │     └── Lyrics:    model.align(vocals.wav, text, original_split=True) → alignment.json
   │
@@ -146,7 +146,9 @@ Each stage prints a header such as `[3/7] Aligning lyrics  (total 02:14)` and a 
 ### Stage 3: alignment
 - Whisper model `--whisper-model`, default `large-v3`. A warning is printed on CPU because it will be slow.
 - Input is `vocals.wav`, not the full mix.
-- Whisper splits Japanese into tokens and has no spaces to work with, so the "words" that stable-ts returns are token chunks of one or more characters, and a byte-level BPE token can split a kanji. Stage 3 stores these chunks unchanged, after mapping each one onto a character range of the lyric line by walking both strings in order. Dividing a chunk's time among its characters needs the readings, so that is done in Stage 4. This keeps Stage 3 independent of `lyrics_ruby.txt` edits.
+- In auto language mode, Whisper scores up to five vocal-active clips from different parts of the song. The average score selects one language for the run.
+- Transcription starts with stable-ts's loudness-based silence handling. It tries the speech activity detector if the first pass returns no segments.
+- Stage 3 matches normalized timed text across Whisper segment boundaries and maps each complete match back to its original lyric characters. If a timed token crosses a lyric line break, the two lines share its interval in proportion to the number of matched characters.
 - `alignment.json` schema: `{"lines": [{"text": str, "chunks": [{"first": int, "last": int, "start": float, "end": float}]}]}`. `first` and `last` are inclusive character indices into `text`.
 - Online lyrics aggregation (TODO): Support querying lyric search providers by track metadata when `--lyrics` is omitted, populating `lyrics.txt` with external reference lyrics to avoid hallucination before running forced alignment.
 
@@ -159,7 +161,8 @@ Readings:
 - Mora counting: small ゃゅょぁぃぅぇぉゎ merge with the preceding kana; っ, ん and ー each count as one mora.
 
 Timing:
-- Character times: a chunk from `alignment.json` that covers several characters has its span divided among them in proportion to their mora counts (taken from the readings above, where a kanji group's morae are shared evenly among its characters). Characters that are not sung (punctuation, spaces) get zero duration.
+- Stage 4 checks that the displayed lyric text and character spans match `alignment.json`. It reports untimed lyrics, starts near silence, repeated equal-duration timings, and sustained vocal activity outside timed lyrics.
+- Character times use mora weights within each chunk and within gaps bounded by two chunks. Untimed prefixes and suffixes take the nearest boundary. Punctuation and spaces take zero duration.
 - A ruby group spans from the start of its first base character to the end of its last. That span is divided equally among the group's ruby morae, unless the base characters carry separate alignment times and the reading can be split per character, in which case each character's own span is used.
 
 Layout (all coordinates use `PlayResX=1920`, `PlayResY=1080`, `ScaledBorderAndShadow: yes`, `WrapStyle: 2`, and `\an7\pos(x,y)` on every event so positions are absolute):
@@ -265,7 +268,7 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 | `--style` | `dam` | `dam` or `joysound` color/layout preset. |
 | `--guide-timbre` | `continuous` | `continuous`, `vibraphone`, or `glockenspiel`. |
 | `--whisper-model` | `large-v3` (or `medium` if <6GB VRAM) | Whisper model name for stable-ts. |
-| `--language` | `auto` | Spoken language code for Whisper (`auto`, `ja`, `en`, etc.). Auto-detects from vocals or lyrics. |
+| `--language` | `auto` | Language code for Whisper (`auto`, `ja`, `en`, etc.). Auto samples the vocal stem across the song. |
 | `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |
 | `--font` | `cache/fonts/` Noto Sans CJK JP Bold | Subtitle font file. |
 | `--force STAGE` | none | Regenerate this stage and everything after it, even edited artifacts (prompts for confirmation before discarding edits). |
