@@ -187,13 +187,14 @@ Wipe (body and outline):
 
 ### Stage 5: guide melody
 - Load `vocals.wav` with `soundfile`, downmix to mono and resample to 16 kHz before passing the tensor to `torchcrepe.predict`. Do not use `torchcrepe.load.audio`, so that torchaudio I/O is never involved.
-- Call `torchcrepe.predict(..., fmin=65, fmax=1100, model="full" on CUDA else "tiny", decoder=viterbi, return_periodicity=True)` with a 10 ms hop (check the keyword name against the installed version).
-- Treat a frame as voiced when periodicity > 0.5, the frame RMS is above a gate set relative to the stem's peak RMS, and the frame falls within an aligned lyric chunk window (±50 ms). Bridge brief unvoiced dropouts (≤ 50 ms) when neighboring pitches match, then apply a median filter within each contiguous voiced segment so unvoiced zeros do not pull boundary frames down.
-- Segment notes: start a new note when the pitch shifts by ≥ 0.75 semitones from the current note's median and sustains the new pitch for ≥ 120 ms (hysteresis against vibrato and scoops), and also at chunk onsets from `alignment.json` once the current note has lasted ≥ 120 ms. Absorb brief pre-note scoops (< 120 ms) and rapid 1-semitone ornamentation blips into the surrounding note, and drop notes shorter than 70 ms. The output is monophonic by construction.
+- Run CREPE with a 10 ms hop and a 45–1100 Hz range, using the full model on CUDA and the tiny model on CPU. Convert the decoded pitch bins to their center frequencies for repeatable note extraction.
+- Gate on periodicity and RMS. When lyric timing exists, admit pitch within 120 ms of a timed chunk. Bridge brief unvoiced dropouts when neighboring pitches agree, then median-filter the voiced runs.
+- Split notes when a new pitch holds across most of a 120 ms window, or across 70 ms with stronger periodicity and pitch agreement. Lyric chunk boundaries alone do not split notes. Absorb short scoops and brief octave excursions that return to the previous pitch.
+- For jumps close to an octave within one lyric phrase, compare odd and even harmonics in the vocal stem. Choose the nearer octave only when the harmonic balance supports it. If the note crosses into the next phrase, keep the original pitch there.
 - Write `guide.mid` with mido (0-based General MIDI program 11 Vibraphone or 9 Glockenspiel, matching `--guide-timbre`, for DAW users).
-- Synthesize `guide.wav` according to `--guide-timbre` (default `continuous`):
-  - `continuous`: directly drives a warm phase-continuous oscillator (`1× + 0.22×2 + 0.06×3` harmonics) from the smoothed continuous f0 contour and the vocal stem's own smoothed RMS/periodicity envelope, avoiding discrete note attacks or semitone quantization.
-  - `vibraphone` / `glockenspiel`: synthesizes discrete notes from `guide.mid` (so that MIDI edits are honored) as a warm additive mallet tone, with softened raised-cosine attack and attenuated overtones on legato transitions. All guide outputs are peak-normalized to −1 dBFS at the length of `source.wav`.
+- All timbres synthesize `guide.wav` from `guide.mid`, including any MIDI edits. The output is peak-normalized to −1 dBFS at the length of `source.wav`.
+  - `continuous` (default) sustains a soft harmonic tone at each note's pitch with short fades. Its volume follows a smoothed, compressed envelope from the vocal stem, including syllable accents within held notes.
+  - `vibraphone` and `glockenspiel` use decaying mallet tones with softer attacks on legato transitions.
 
 ### Stage 6: background
 - No `--bg`: use `cache/bg/bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
