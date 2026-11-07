@@ -489,7 +489,7 @@ def alignment_coverage(line):
 
 
 def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
-    if all(alignment_coverage(line) >= 0.65 for line in aligned) and all(
+    if all(alignment_coverage(line) == 1.0 for line in aligned) and all(
         previous["chunks"][-1]["end"] <= current["chunks"][0]["start"] + 0.5
         for previous, current in zip(aligned, aligned[1:])
     ):
@@ -514,7 +514,7 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
         )
         if (
             recovered[index]["chunks"]
-            and alignment_coverage(recovered[index]) >= 0.65
+            and alignment_coverage(recovered[index]) == 1.0
             and recovered[index]["chunks"][0]["start"] + 0.5 >= previous_end
         ):
             continue
@@ -523,7 +523,7 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
             continue
         candidates = []
         for position, segment in enumerate(transcript.segments):
-            if segment.start < previous_end:
+            if segment.end <= previous_end:
                 continue
             heard = segment.text
             end_segment = segment
@@ -543,6 +543,15 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
                 if score >= 0.65:
                     candidates.append((score, segment.start, end_segment.end))
         candidates.sort(key=lambda item: item[0], reverse=True)
+        if recovered[index]["chunks"]:
+            original_start = recovered[index]["chunks"][0]["start"]
+            nearby = [
+                candidate
+                for candidate in candidates
+                if abs(candidate[1] - original_start) <= 15
+            ]
+            if nearby:
+                candidates = nearby
         alternatives = (
             [
                 candidate
@@ -700,7 +709,7 @@ def stage3_align(
         upstream,
         {
             "stage": 3,
-            "version": 4,
+            "version": 5,
             "whisper_model": whisper_model,
             "language": language,
         },
