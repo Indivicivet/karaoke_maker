@@ -478,14 +478,24 @@ def map_alignment_chunks(lines, segments):
     ]
 
 
+def alignment_coverage(line):
+    positions = [index for _, index in normalized_characters(line["text"])]
+    if not positions:
+        return 1.0
+    return sum(
+        any(chunk["first"] <= index <= chunk["last"] for chunk in line["chunks"])
+        for index in positions
+    ) / len(positions)
+
+
 def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
-    if all(line["chunks"] for line in aligned) and all(
+    if all(alignment_coverage(line) >= 0.65 for line in aligned) and all(
         previous["chunks"][-1]["end"] <= current["chunks"][0]["start"] + 0.5
         for previous, current in zip(aligned, aligned[1:])
     ):
         return aligned
 
-    print("  Searching the vocal transcription for untimed lyric lines.")
+    print("  Searching the vocal transcription for poorly timed lyric lines.")
     transcript = model.transcribe(
         str(vocals_wav),
         language=language,
@@ -504,6 +514,7 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
         )
         if (
             recovered[index]["chunks"]
+            and alignment_coverage(recovered[index]) >= 0.65
             and recovered[index]["chunks"][0]["start"] + 0.5 >= previous_end
         ):
             continue
@@ -529,7 +540,7 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
                 score = sum(block.size for block in match.get_matching_blocks()) / len(
                     expected
                 )
-                if score >= 0.7:
+                if score >= 0.65:
                     candidates.append((score, segment.start, end_segment.end))
         candidates.sort(key=lambda item: item[0], reverse=True)
         alternatives = (
@@ -541,6 +552,20 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
             if candidates
             else []
         )
+        if alternatives and recovered[index]["chunks"]:
+            original_start = recovered[index]["chunks"][0]["start"]
+            closest = sorted(
+                [candidates[0], *alternatives],
+                key=lambda candidate: abs(candidate[1] - original_start),
+            )
+            if (
+                abs(closest[0][1] - original_start) <= 15
+                and abs(closest[1][1] - original_start)
+                - abs(closest[0][1] - original_start)
+                >= 15
+            ):
+                candidates = [closest[0]]
+                alternatives = []
         if not candidates or (
             alternatives and candidates[0][0] - alternatives[0][0] < 0.1
         ):
@@ -568,7 +593,15 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
         for chunk in candidate["chunks"]:
             chunk["start"] += start
             chunk["end"] += start
-        if candidate["chunks"]:
+        if (
+            candidate["chunks"]
+            and alignment_coverage(candidate) > alignment_coverage(recovered[index])
+            or (
+                candidate["chunks"]
+                and recovered[index]["chunks"]
+                and recovered[index]["chunks"][0]["start"] + 0.5 < previous_end
+            )
+        ):
             recovered[index] = candidate
             print(f"  Re-aligned lyric line {index + 1} at {start:.1f}s.")
     return recovered
