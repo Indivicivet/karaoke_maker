@@ -478,6 +478,102 @@ def map_alignment_chunks(lines, segments):
     ]
 
 
+def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
+    if all(line["chunks"] for line in aligned) and all(
+        previous["chunks"][-1]["end"] <= current["chunks"][0]["start"] + 0.5
+        for previous, current in zip(aligned, aligned[1:])
+    ):
+        return aligned
+
+    print("  Searching the vocal transcription for untimed lyric lines.")
+    transcript = model.transcribe(
+        str(vocals_wav),
+        language=language,
+        vad=False,
+        stream=False,
+        fp16=False,
+    )
+    import whisper
+
+    audio = whisper.load_audio(str(vocals_wav))
+    recovered = list(aligned)
+    for index, line in enumerate(lines):
+        previous_end = max(
+            (chunk["end"] for item in recovered[:index] for chunk in item["chunks"]),
+            default=0.0,
+        )
+        if (
+            recovered[index]["chunks"]
+            and recovered[index]["chunks"][0]["start"] + 0.5 >= previous_end
+        ):
+            continue
+        expected = "".join(char for char, _ in normalized_characters(line))
+        if not expected:
+            continue
+        candidates = []
+        for position, segment in enumerate(transcript.segments):
+            if segment.start < previous_end:
+                continue
+            heard = segment.text
+            end_segment = segment
+            for following in transcript.segments[position : position + 2]:
+                if following is not segment:
+                    if following.start - segment.end > 4:
+                        break
+                    heard += following.text
+                    end_segment = following
+                normalized = "".join(char for char, _ in normalized_characters(heard))
+                match = difflib.SequenceMatcher(
+                    None, expected, normalized, autojunk=False
+                )
+                score = sum(block.size for block in match.get_matching_blocks()) / len(
+                    expected
+                )
+                if score >= 0.7:
+                    candidates.append((score, segment.start, end_segment.end))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        alternatives = (
+            [
+                candidate
+                for candidate in candidates[1:]
+                if candidate[1] >= candidates[0][2] or candidate[2] <= candidates[0][1]
+            ]
+            if candidates
+            else []
+        )
+        if not candidates or (
+            alternatives and candidates[0][0] - alternatives[0][0] < 0.1
+        ):
+            matches = ", ".join(
+                f"{start:.1f}s ({score:.2f})" for score, start, _ in candidates[:3]
+            )
+            print(
+                f"  [warning] Could not locate lyric line {index + 1} "
+                f"unambiguously: {matches or 'no matches'}."
+            )
+            continue
+        start = max(previous_end, candidates[0][1] - 1.0)
+        end = min(len(audio) / 16000, candidates[0][2] + 1.0)
+        result = model.align(
+            audio[round(start * 16000) : round(end * 16000)],
+            line,
+            language=language,
+            original_split=True,
+            vad=False,
+            nonspeech_skip=None,
+        )
+        if result is None:
+            continue
+        candidate = map_alignment_chunks([line], result.segments)[0]
+        for chunk in candidate["chunks"]:
+            chunk["start"] += start
+            chunk["end"] += start
+        if candidate["chunks"]:
+            recovered[index] = candidate
+            print(f"  Re-aligned lyric line {index + 1} at {start:.1f}s.")
+    return recovered
+
+
 def vocal_activity(samples, sample_rate):
     frame_size = max(1, round(sample_rate * 0.02))
     frame_seconds = frame_size / sample_rate
@@ -571,7 +667,7 @@ def stage3_align(
         upstream,
         {
             "stage": 3,
-            "version": 3,
+            "version": 4,
             "whisper_model": whisper_model,
             "language": language,
         },
@@ -656,6 +752,10 @@ def stage3_align(
             lyrics_txt.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
 
     out_lines = map_alignment_chunks(clean_lines, result.segments)
+    if has_user_lyrics:
+        out_lines = recover_untimed_lines(
+            model, vocals_wav, resolved_lang, clean_lines, out_lines
+        )
     if alignment_json not in kept:
         alignment_json.write_text(
             json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
