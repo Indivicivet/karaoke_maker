@@ -185,16 +185,18 @@ Wipe (body and outline):
   - Gotcha: `y0`/`y1` and the first and last `x` must be widened by `\bord` + `\shad` (scaled) so that outline pixels outside the advance box are not clipped.
 - `--style dam|joysound` chooses the color/outline presets. The preset colors approximate the look of each brand rather than reproducing exact arcade palettes, and can be overridden in the generated ASS styles.
 
-### Stage 5: guide melody
+### Stage 5: guide melody and filtered vocals
 - Load `vocals.wav` with `soundfile`, downmix to mono and resample to 16 kHz before passing the tensor to `torchcrepe.predict`. Do not use `torchcrepe.load.audio`, so that torchaudio I/O is never involved.
-- Run CREPE with a 10 ms hop and a 45–1100 Hz range, using the full model on CUDA and the tiny model on CPU. Convert the decoded pitch bins to their center frequencies for repeatable note extraction.
-- Gate on periodicity and RMS. When lyric timing exists, admit pitch within 120 ms of a timed chunk. Bridge brief unvoiced dropouts when neighboring pitches agree, then median-filter the voiced runs.
-- Split notes when a new pitch holds across most of a 120 ms window, or across 70 ms with stronger periodicity and pitch agreement. Lyric chunk boundaries alone do not split notes. Absorb short scoops and brief octave excursions that return to the previous pitch.
-- For jumps close to an octave within one lyric phrase, compare odd and even harmonics in the vocal stem. Choose the nearer octave only when the harmonic balance supports it. If the note crosses into the next phrase, keep the original pitch there.
+- Run CREPE with a 10 ms hop and a 45–1100 Hz range, using the full model on CUDA and the tiny model on CPU, with a leap-capable Viterbi decoder (`decode_guide_pitch`) and bin-center frequencies for repeatable extraction.
+- Gate on two-tier periodicity and RMS (high confidence anywhere, plus relaxed threshold inside timed lyric chunks). Bridge brief unvoiced dropouts when neighboring pitches agree, then median-filter the voiced runs.
+- Split notes down to 60 ms on stable pitch changes, absorb brief harmonic/octave spikes, and re-articulate long sustained notes at distinct lyric chunk onsets.
+- For jumps close to an octave, compare odd and even harmonics in the vocal stem and choose the nearer octave when the harmonic balance supports it.
 - Write `guide.mid` with mido (0-based General MIDI program 11 Vibraphone or 9 Glockenspiel, matching `--guide-timbre`, for DAW users).
-- All timbres synthesize `guide.wav` from `guide.mid`, including any MIDI edits. The output is peak-normalized to −1 dBFS at the length of `source.wav`.
-  - `continuous` (default) sustains a soft harmonic tone at each note's pitch with short fades. Its volume follows a smoothed, compressed envelope from the vocal stem, including syllable accents within held notes.
+- Standard guide timbres synthesize `guide.wav` from `guide.mid`, including any MIDI edits, peak-normalized/soft-limited at −1 dBFS at the length of `source.wav`:
+  - `continuous` (default) sustains a warm harmonic tone with soft onset chiff and vibrato on held notes, following a smoothed, compressed vocal RMS envelope.
   - `vibraphone` and `glockenspiel` use decaying mallet tones with softer attacks on legato transitions.
+  - `simple` bypasses `guide.mid` and `alignment.json`, directly synthesizing a 2-harmonic synth at the continuous smoothed CREPE pitch modulated by smoothed vocal RMS (currently cursed; best kept quiet around `--guide-vol 0.2` under `--filtered-vocal-vol 0.6`).
+- Filtered vocals (`vocals_filtered.wav`, used when `--filtered-vocal-vol > 0`): synthesized purely from `vocals.wav` (no Whisper/alignment dependency) via high-pass filtering, soft STFT HPSS, cepstral vocal-tract formant smoothing, warm spectral tilt, RMS leveling, and subtle stereo diffusion.
 
 ### Stage 6: background
 - No `--bg`: use `cache/bg/bg_default_1080p30.mp4`. If it is not there, generate it by rendering 300 frames (10 s at 30 fps) of soft Gaussian particles over a dark vertical gradient in numpy and piping raw RGB to FFmpeg (`libx264`, `yuv420p`).
@@ -236,6 +238,7 @@ Input strings convert to linear amplitude multipliers before building FFmpeg fil
 |---|---|---|
 | Instrumental level | `--inst-vol` | `1.0` |
 | Guide chime level | `--guide-vol` | `0.3` |
+| Filtered vocal level | `--filtered-vocal-vol` | `0.0` |
 | Vocal guide level | `--vocal-vol` | `0.0` (`1.0` with `split-lr`) |
 
 ### Encoding
@@ -265,9 +268,9 @@ python karaoke_maker.py "song.mp3" --bg "background.mp4" --audio-layout dual-tra
 | `--workspace` | `songs/<stem>_karaoke` | Song workspace folder (inside the repo). |
 | `--bg` | cached default loop | Background video or image. |
 | `--audio-layout` | `mix` | `mix`, `dual-track` or `split-lr`. |
-| `--inst-vol`, `--guide-vol`, `--vocal-vol` | see table | Stem levels. |
+| `--inst-vol`, `--guide-vol`, `--filtered-vocal-vol`, `--vocal-vol` | see table | Stem levels. |
 | `--style` | `dam` | `dam` or `joysound` color/layout preset. |
-| `--guide-timbre` | `continuous` | `continuous`, `vibraphone`, or `glockenspiel`. |
+| `--guide-timbre` | `continuous` | `simple`, `continuous`, `vibraphone`, or `glockenspiel`. |
 | `--whisper-model` | `large-v3` (or `medium` if <6GB VRAM) | Whisper model name for stable-ts. |
 | `--language` | `auto` | Language code for Whisper (`auto`, `ja`, `en`, etc.). Auto samples the vocal stem across the song. |
 | `--sep-model` | RoFormer vocal model | `audio-separator` model file name. |
