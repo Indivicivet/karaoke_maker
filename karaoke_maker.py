@@ -28,14 +28,16 @@ os.environ["HF_HOME"] = str(CACHE_DIR / "hf")
 
 from fontTools.ttLib import TTFont
 import fugashi
+import librosa
 import mido
 from mido import Message, MetaMessage, MidiFile, MidiTrack
 import numpy as np
-from scipy.ndimage import median_filter
-from scipy.signal import resample_poly
+from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.signal import butter, resample_poly, sosfiltfilt
 import soundfile as sf
 import stable_whisper
 import torch
+import torch.nn.functional as F
 import torchcrepe
 
 STAGES = ["decode", "separate", "align", "ass", "guide", "bg", "render"]
@@ -2229,37 +2231,204 @@ def synthesize_continuous_guide(
     if len(rms) >= 3:
         rms = np.convolve(rms, [0.25, 0.5, 0.25], mode="same")
     if len(rms):
-        reference = max(float(np.percentile(rms, 95)), 1e-6)
-        # Compress the vocal dynamics so quiet syllables remain audible in the mix.
-        envelope = np.clip(rms / reference, 0.0, 1.0) ** 0.6
+        active_rms = rms[rms > float(np.max(rms)) * 0.02]
+        reference = (
+            max(float(np.percentile(active_rms, 90)), 1e-6)
+            if len(active_rms)
+            else max(float(np.percentile(rms, 95)), 1e-6)
+        )
+        # Compress vocal dynamics so quiet verses remain clearly audible under rock mixes.
+        envelope = np.clip(rms / reference, 0.0, 1.0) ** 0.42
         frame_times = (np.arange(len(rms)) + 0.5) * hop / vocal_rate
-    for start, end, pitch in read_guide_notes(midi_path, duration_sec):
+
+    notes = read_guide_notes(midi_path, duration_sec)
+    partials = [(1.0, 1.0, 0.0), (2.0, 0.28, 0.0), (3.0, 0.09, 12.0), (4.0, 0.04, 18.0)]
+    for idx, (start, end, pitch) in enumerate(notes):
         first = max(0, round(start * sr))
         stop = min(len(buf), round(end * sr))
         length = stop - first
         if length <= 0:
             continue
-        phase = np.arange(length) * (2 * np.pi * 440 / sr) * 2 ** ((pitch - 69) / 12)
-        tone = np.sin(phase) + 0.22 * np.sin(2 * phase) + 0.06 * np.sin(3 * phase)
+        t = np.arange(length, dtype=np.float32) / float(sr)
+        f0 = 440.0 * (2.0 ** ((pitch - 69.0) / 12.0))
+        is_legato = idx > 0 and (start - notes[idx - 1][1]) <= 0.025
+        # Gentle vibrato after 200 ms on held notes, classic DAM guide synth style.
+        vib_env = np.clip((t - 0.20) / 0.14, 0.0, 1.0)
+        phase = 2.0 * np.pi * f0 * t + (0.0028 * f0) * vib_env * np.sin(
+            2.0 * np.pi * 5.2 * t
+        )
+        tone = np.zeros(length, dtype=np.float32)
+        chiff_scale = 0.45 if is_legato else 1.0
+        for ratio, amp, decay in partials:
+            if f0 * ratio < sr * 0.45:
+                env_p = np.exp(-decay * t) * chiff_scale if decay > 0 else 1.0
+                tone += amp * env_p * np.sin(ratio * phase)
+
         if len(rms):
             tone *= 0.12 + 0.88 * np.interp(
                 np.arange(first, stop) / sr, frame_times, envelope
             )
-        fade_length = min(round(0.018 * sr), length // 2)
-        if fade_length:
-            fade = np.sin(np.linspace(0, np.pi / 2, fade_length)) ** 2
-            tone[:fade_length] *= fade
-            tone[-fade_length:] *= fade[::-1]
+        att_len = min(round((0.016 if is_legato else 0.010) * sr), length // 2)
+        rel_len = min(round(0.016 * sr), length // 2)
+        if att_len:
+            tone[:att_len] *= np.sin(np.linspace(0, np.pi / 2, att_len)) ** 2
+        if rel_len:
+            tone[-rel_len:] *= np.sin(np.linspace(0, np.pi / 2, rel_len))[::-1] ** 2
         buf[first:stop] += tone
 
     peak = float(np.max(np.abs(buf), initial=0.0))
     if peak > 1e-6:
-        buf *= 10 ** (-1 / 20) / peak
+        # Soft-clip rare note overlaps so one transient cannot pull the whole guide down.
+        scale_ref = max(
+            (
+                float(np.percentile(np.abs(buf[buf != 0]), 99.5))
+                if np.any(buf != 0)
+                else peak
+            ),
+            1e-6,
+        )
+        buf = np.tanh(buf / (scale_ref * 1.15)) * (10 ** (-1 / 20))
     sf.write(str(out_wav), np.column_stack([buf, buf]), sr, subtype="FLOAT")
 
 
+def synthesize_filtered_vocals(vocals_wav: Path, out_wav: Path):
+    """Create a softened, de-sung shadow vocal directly from vocals.wav without lyrics/Whisper."""
+    audio, sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
+    mono = audio.mean(axis=1)
+    n_samples = len(mono)
+
+    if n_samples < 32:
+        sf.write(str(out_wav), audio, sr, subtype="FLOAT")
+        return
+
+    sos_hp = butter(2, 100.0, btype="highpass", fs=sr, output="sos")
+    sig = sosfiltfilt(sos_hp, mono).astype(np.float32)
+
+    n_fft = 2048
+    hop = 512
+    win = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+    pad_len = n_fft
+    sig_pad = np.pad(sig, (pad_len, pad_len))
+    frames = np.lib.stride_tricks.sliding_window_view(sig_pad, n_fft)[::hop]
+    n_frames = len(frames)
+    spec = np.fft.rfft(frames * win, axis=1)
+    mag = np.abs(spec)
+    phase = np.angle(spec)
+
+    # Vectorized HPSS median filter (on GPU when available) to isolate pitched harmonics
+    # while softly attenuating consonants, sibilance, breaths, and scream grit.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mag_t = torch.from_numpy(mag).to(device)
+    h_med = (
+        F.pad(mag_t.T.unsqueeze(0), (7, 7), mode="reflect")
+        .squeeze(0)
+        .unfold(1, 15, 1)
+        .median(dim=-1)
+        .values.T
+    )
+    p_med = (
+        F.pad(mag_t.unsqueeze(0), (8, 8), mode="reflect")
+        .squeeze(0)
+        .unfold(1, 17, 1)
+        .median(dim=-1)
+        .values
+    )
+    tonal_mask = (
+        ((h_med * h_med) / (h_med * h_med + p_med * p_med + 1e-12)).cpu().numpy()
+    )
+    del mag_t, h_med, p_med
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    mag_tonal = mag * (0.15 + 0.85 * tonal_mask)
+
+    # Cepstral vocal-tract smoothing: dampen low-quefrency vowel formants (0.1..1.8 ms)
+    # while preserving the higher-quefrency harmonic pitch comb.
+    log_mag = np.log(mag_tonal + 1e-6)
+    ceps = np.fft.irfft(log_mag, n=n_fft, axis=1)
+    q_low = max(3, round(0.0001 * sr))
+    q_high = round(0.0018 * sr)
+    ceps[:, q_low:q_high] *= 0.35
+    ceps[:, n_fft - q_high + 1 : n_fft - q_low + 1] *= 0.35
+    mag_desung = np.exp(np.fft.rfft(ceps, n=n_fft, axis=1).real)
+    mag_blend = 0.70 * mag_desung + 0.30 * mag_tonal
+
+    # Gentle warm rolloff above 1.7 kHz and mild 2.6 kHz presence dip.
+    lpf = 1.0 / np.sqrt(1.0 + (freqs / 1700.0) ** 4)
+    presence_dip = 1.0 - 0.35 * np.exp(-0.5 * ((freqs - 2600.0) / 700.0) ** 2)
+    mag_eq = mag_blend * (lpf * presence_dip).astype(np.float32)[None, :]
+
+    recon_frames = np.fft.irfft(mag_eq * np.exp(1j * phase), n=n_fft, axis=1) * win
+    out_pad = np.zeros(len(sig_pad), dtype=np.float32)
+    win_norm = np.zeros(len(sig_pad), dtype=np.float32)
+    win_sq = win * win
+    for idx in range(n_frames):
+        s = idx * hop
+        out_pad[s : s + n_fft] += recon_frames[idx]
+        win_norm[s : s + n_fft] += win_sq
+    out_mono = out_pad[pad_len : pad_len + n_samples] / np.maximum(
+        win_norm[pad_len : pad_len + n_samples], 1e-6
+    )
+
+    # Smooth dynamic leveling so quiet verses remain audible and loud screams stay tame.
+    env_win = max(1, round(0.04 * sr))
+    rms_env = np.sqrt(
+        gaussian_filter1d(out_mono * out_mono, sigma=env_win) + 1e-12
+    ).astype(np.float32)
+    active_env = rms_env[rms_env > float(np.percentile(rms_env, 20)) * 2.0]
+    target_rms = (
+        float(np.median(active_env)) if len(active_env) else float(np.max(rms_env))
+    )
+    if target_rms > 1e-6:
+        floor = target_rms * 0.08
+        gain = np.where(
+            rms_env > floor,
+            (target_rms / np.maximum(rms_env, floor)) ** 0.45,
+            rms_env / max(floor, 1e-6),
+        )
+        out_mono = out_mono * np.clip(gain, 0.25, 2.5)
+
+    # Subtle stereo diffusion so the softened vocal sits behind the singer.
+    d1 = round(0.011 * sr)
+    d2 = round(0.017 * sr)
+    left = out_mono.copy()
+    right = out_mono.copy()
+    if n_samples > d2:
+        left[d1:] += 0.18 * out_mono[:-d1]
+        right[d2:] += 0.18 * out_mono[:-d2]
+        left[d2:] -= 0.10 * out_mono[:-d2]
+        right[d1:] -= 0.10 * out_mono[:-d1]
+    stereo = np.column_stack([left, right])
+
+    peak = float(np.max(np.abs(stereo), initial=0.0))
+    if peak > 1e-6:
+        stereo *= (10.0 ** (-1.0 / 20.0)) / peak
+    sf.write(str(out_wav), stereo, sr, subtype="FLOAT")
+
+
 def decode_guide_pitch(probabilities):
-    bins, _ = torchcrepe.decode.viterbi(probabilities)
+    """Viterbi decode CREPE sigmoid activations while allowing melodic leaps."""
+    if not hasattr(decode_guide_pitch, "_transition"):
+        idx = np.arange(360)
+        dist = np.abs(idx[:, None] - idx[None, :])
+        local = np.maximum(12.0 - dist, 0.0)
+        trans = local + 0.004 * np.exp(-dist / 7.0) + 1e-6
+        trans /= trans.sum(axis=1, keepdims=True)
+        decode_guide_pitch._transition = trans
+
+    probs_np = np.clip(probabilities.detach().cpu().numpy(), 1e-6, 1.0)
+    probs_np /= probs_np.sum(axis=1, keepdims=True)
+    bins_np = np.array(
+        [
+            librosa.sequence.viterbi(seq, decode_guide_pitch._transition).astype(
+                np.int64
+            )
+            for seq in probs_np
+        ]
+    )
+    bins = torch.tensor(bins_np, device=probabilities.device)
     # Use CREPE's bin centers without the random dither in its Hz conversion.
     cents = torchcrepe.CENTS_PER_BIN * bins + 1997.3794084376191
     return bins, torchcrepe.convert.cents_to_frequency(cents)
@@ -2342,9 +2511,11 @@ def guide_pitch_notes(pitches, periodicity):
             and np.median(periodicity[first:stop]) >= 0.65
         )
 
-    def finish_note(stop):
+    def finish_note(stop, min_edge_frames: int = 6):
         pitch = round(float(np.median(pitches[pitch_start:stop])))
-        if stop - pitch_start >= 10 or stable_short_note(pitch_start, stop, pitch):
+        if stop - pitch_start >= min_edge_frames or stable_short_note(
+            pitch_start, stop, pitch
+        ):
             notes.append((start * 0.01, stop * 0.01, pitch))
             return True
         return False
@@ -2377,8 +2548,8 @@ def guide_pitch_notes(pitches, periodicity):
                         holds or stable_short_note(end, end + len(short_ahead), target)
                     )
                 ):
-                    if finish_note(end):
-                        start = end
+                    finish_note(end)
+                    start = end
                     pitch_start = end
         end += 1
 
@@ -2387,220 +2558,328 @@ def guide_pitch_notes(pitches, periodicity):
     return notes
 
 
+def clean_guide_notes(
+    notes: list[tuple[float, float, int]],
+    audio_16k: np.ndarray,
+    sr: int,
+    lyric_starts: list[float],
+    chunk_starts: list[float],
+) -> list[tuple[float, float, int]]:
+    """Remove brief harmonic spikes, resolve octaves, and re-articulate repeated lyric chunks."""
+    if not notes:
+        return notes
+
+    cleaned = list(notes)
+    for _ in range(3):
+        out = []
+        i = 0
+        changed = False
+        while i < len(cleaned):
+            if out and i + 1 < len(cleaned):
+                t0_a, t1_a, p_a = out[-1]
+                t0_b, t1_b, p_b = cleaned[i]
+                t0_c, t1_c, p_c = cleaned[i + 1]
+                if (
+                    (t1_b - t0_b) < 0.25
+                    and (t0_b - t1_a) <= 0.12
+                    and (t0_c - t1_b) <= 0.12
+                    and abs(p_b - p_a) >= 7
+                    and abs(p_b - p_c) >= 7
+                    and abs(p_a - p_c) <= 3
+                ):
+                    if p_a == p_c and (t0_c - t1_a) <= 0.30:
+                        out[-1] = (t0_a, t1_c, p_a)
+                        i += 2
+                    else:
+                        i += 1
+                    changed = True
+                    continue
+            out.append(cleaned[i])
+            i += 1
+        cleaned = out
+        if not changed:
+            break
+
+    if lyric_starts:
+        cleaned = correct_guide_octaves(cleaned, audio_16k, sr, lyric_starts)
+
+    # Also resolve isolated octave excursions before/between lyric phrases.
+    resolved = []
+    for i, (t0_b, t1_b, p_b) in enumerate(cleaned):
+        if resolved and i + 1 < len(cleaned):
+            _, t1_a, p_a = resolved[-1]
+            t0_c, _, p_c = cleaned[i + 1]
+            delta = p_b - p_a
+            if (
+                abs(delta) in (11, 12, 13)
+                and abs(p_c - p_a) <= 2
+                and (t0_b - t1_a) <= 0.25
+                and (t0_c - t1_b) <= 0.25
+                and (t1_b - t0_b) >= 0.10
+            ):
+                alt = p_b - 12 if delta > 0 else p_b + 12
+                ratio = octave_harmonic_ratio(audio_16k, sr, t0_b, t1_b, min(p_b, alt))
+                if ratio is not None and (
+                    (delta < 0 and ratio < 0.45) or (delta > 0 and ratio > 1.1)
+                ):
+                    resolved.append((t0_b, t1_b, alt))
+                    continue
+        resolved.append((t0_b, t1_b, p_b))
+
+    if not chunk_starts:
+        return resolved
+
+    # Re-articulate long sustained notes at distinct lyric chunk onsets.
+    articulated = []
+    for t0, t1, pitch in resolved:
+        if t1 - t0 < 0.30:
+            articulated.append((t0, t1, pitch))
+            continue
+        splits = [cs for cs in chunk_starts if t0 + 0.12 <= cs <= t1 - 0.10]
+        cur_start = t0
+        for cs in splits:
+            if cs - cur_start >= 0.12 and t1 - cs >= 0.10:
+                articulated.append((cur_start, cs - 0.012, pitch))
+                cur_start = cs
+        articulated.append((cur_start, t1, pitch))
+    return articulated
+
+
 def stage5_guide(
     workspace: Path,
     guide_timbre: str,
     manifest: dict,
     force: bool,
+    guide_vol: float = 0.3,
+    filtered_vocal_vol: float = 0.0,
 ) -> bool:
     source_wav = workspace / "source.wav"
     vocals_wav = workspace / "vocals.wav"
     alignment_json = workspace / "alignment.json"
     guide_mid = workspace / "guide.mid"
     guide_wav = workspace / "guide.wav"
+    filtered_wav = workspace / "vocals_filtered.wav"
 
-    mid_fp = compute_fingerprint(
-        [vocals_wav, alignment_json],
-        {"stage": "5_mid_v6", "timbre": guide_timbre},
-    )
-    run_mid, kept_mid = check_stage_status([guide_mid], mid_fp, manifest, force)
+    need_guide = guide_vol > 0.0 or force
+    need_filtered = filtered_vocal_vol > 0.0 or force
+    did_work = False
 
-    if run_mid:
-        audio, sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
-        mono = audio.mean(axis=1)
-        target_sr = 16000
-        if sr != target_sr:
-            g = math.gcd(sr, target_sr)
-            mono_16k = resample_poly(mono, target_sr // g, sr // g).astype(np.float32)
-        else:
-            mono_16k = mono
-
-        hop_length = 160  # 10 ms at 16 kHz
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        crepe_model = "full" if device == "cuda" else "tiny"
-        audio_tensor = torch.from_numpy(mono_16k).unsqueeze(0)
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        f0, pd = torchcrepe.predict(
-            audio_tensor,
-            sample_rate=target_sr,
-            hop_length=hop_length,
-            fmin=45.0,
-            fmax=1100.0,
-            model=crepe_model,
-            decoder=decode_guide_pitch,
-            return_periodicity=True,
-            batch_size=1024 if device == "cuda" else 256,
-            device=device,
+    if need_guide:
+        mid_fp = compute_fingerprint(
+            [vocals_wav, alignment_json],
+            {"stage": "5_mid_v7", "timbre": guide_timbre},
         )
-        f0_np = f0.squeeze(0).cpu().numpy()
-        pd_np = pd.squeeze(0).cpu().numpy()
-        del audio_tensor, f0, pd
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        n_frames = len(f0_np)
+        run_mid, kept_mid = check_stage_status([guide_mid], mid_fp, manifest, force)
 
-        rms = np.zeros(n_frames, dtype=np.float32)
-        win = hop_length * 2
-        for i in range(n_frames):
-            s = i * hop_length
-            chunk = mono_16k[s : s + win]
-            if len(chunk) > 0:
-                rms[i] = float(np.sqrt(np.mean(chunk * chunk)))
-
-        peak_rms = float(np.max(rms)) if len(rms) > 0 else 0.0
-        rms_gate = peak_rms * 0.03
-        voiced = (pd_np > 0.5) & (rms > rms_gate) & (f0_np >= 45.0)
-
-        align_data = json.loads(alignment_json.read_text(encoding="utf-8")).get(
-            "lines", []
-        )
-        chunks = [chunk for line in align_data for chunk in line.get("chunks", [])]
-        if chunks:
-            lyric_mask = np.zeros(n_frames, dtype=bool)
-            for chunk in chunks:
-                start = max(0, math.floor((chunk["start"] - 0.12) / 0.01))
-                stop = min(n_frames, math.ceil((chunk["end"] + 0.12) / 0.01))
-                lyric_mask[start:stop] = True
-            voiced &= lyric_mask
-
-        valid_f0 = np.maximum(f0_np, 1e-3)
-        raw_midi = 69.0 + 12.0 * np.log2(valid_f0 / 440.0)
-
-        # Reconnect held pitches when CREPE loses confidence through a consonant.
-        # Require energy through the gap so this does not extend notes across breaths.
-        voiced_bridged = voiced.copy()
-        midi_bridged = raw_midi.copy()
-        idx = 0
-        while idx < n_frames:
-            if not voiced_bridged[idx]:
-                end_idx = idx
-                while end_idx < n_frames and not voiced_bridged[end_idx]:
-                    end_idx += 1
-                gap_len = end_idx - idx
-                if idx >= 3 and end_idx + 3 <= n_frames and gap_len <= 14:
-                    before = slice(idx - 3, idx)
-                    after = slice(end_idx, end_idx + 3)
-                    p_prev = float(np.median(raw_midi[before]))
-                    p_next = float(np.median(raw_midi[after]))
-                    min_energy = 0.25 * min(
-                        np.median(rms[before]), np.median(rms[after])
-                    )
-                    if (
-                        voiced[before].all()
-                        and voiced[after].all()
-                        and abs(p_next - p_prev) <= 0.8
-                        and np.min(rms[idx:end_idx]) > max(rms_gate, min_energy)
-                    ):
-                        voiced_bridged[idx:end_idx] = True
-                        midi_bridged[idx:end_idx] = np.linspace(
-                            p_prev, p_next, gap_len + 2
-                        )[1:-1]
-                idx = end_idx
+        if run_mid:
+            audio, sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
+            mono = audio.mean(axis=1)
+            target_sr = 16000
+            if sr != target_sr:
+                g = math.gcd(sr, target_sr)
+                mono_16k = resample_poly(mono, target_sr // g, sr // g).astype(
+                    np.float32
+                )
             else:
-                idx += 1
+                mono_16k = mono
 
-        # Median filter within contiguous voiced segments so 0.0 doesn't pull boundaries down
-        midi_filt = np.zeros(n_frames, dtype=np.float32)
-        idx = 0
-        while idx < n_frames:
-            if voiced_bridged[idx]:
-                end_idx = idx
-                while end_idx < n_frames and voiced_bridged[end_idx]:
-                    end_idx += 1
-                seg = midi_bridged[idx:end_idx]
-                if len(seg) >= 7:
-                    midi_filt[idx:end_idx] = median_filter(seg, size=7, mode="nearest")
-                elif len(seg) >= 3:
-                    midi_filt[idx:end_idx] = median_filter(seg, size=3, mode="nearest")
+            hop_length = 160  # 10 ms at 16 kHz
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            crepe_model = "full" if device == "cuda" else "tiny"
+            audio_tensor = torch.from_numpy(mono_16k).unsqueeze(0)
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            f0, pd = torchcrepe.predict(
+                audio_tensor,
+                sample_rate=target_sr,
+                hop_length=hop_length,
+                fmin=45.0,
+                fmax=1100.0,
+                model=crepe_model,
+                decoder=decode_guide_pitch,
+                return_periodicity=True,
+                batch_size=1024 if device == "cuda" else 256,
+                device=device,
+            )
+            f0_np = f0.squeeze(0).cpu().numpy()
+            pd_np = pd.squeeze(0).cpu().numpy()
+            del audio_tensor, f0, pd
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            n_frames = len(f0_np)
+
+            rms = np.zeros(n_frames, dtype=np.float32)
+            win = hop_length * 2
+            for i in range(n_frames):
+                s = i * hop_length
+                chunk = mono_16k[s : s + win]
+                if len(chunk) > 0:
+                    rms[i] = float(np.sqrt(np.mean(chunk * chunk)))
+
+            active_rms = rms[rms > 1e-4]
+            ref_rms = float(np.percentile(active_rms, 95)) if len(active_rms) else 0.0
+            rms_gate = max(
+                float(np.max(rms)) * 0.025 if len(rms) else 0.0, ref_rms * 0.04
+            )
+
+            align_data = json.loads(alignment_json.read_text(encoding="utf-8")).get(
+                "lines", []
+            )
+            chunks = [chunk for line in align_data for chunk in line.get("chunks", [])]
+            strong_voiced = (pd_np >= 0.35) & (rms > rms_gate) & (f0_np >= 45.0)
+            if chunks:
+                lyric_mask = np.zeros(n_frames, dtype=bool)
+                for chunk in chunks:
+                    start = max(0, math.floor((chunk["start"] - 0.15) / 0.01))
+                    stop = min(n_frames, math.ceil((chunk["end"] + 0.15) / 0.01))
+                    lyric_mask[start:stop] = True
+                voiced = strong_voiced | (
+                    (pd_np >= 0.20)
+                    & (rms > rms_gate * 0.85)
+                    & (f0_np >= 45.0)
+                    & lyric_mask
+                )
+            else:
+                voiced = strong_voiced
+
+            valid_f0 = np.maximum(f0_np, 1e-3)
+            raw_midi = 69.0 + 12.0 * np.log2(valid_f0 / 440.0)
+
+            # Reconnect held pitches when CREPE loses confidence through a consonant.
+            voiced_bridged = voiced.copy()
+            midi_bridged = raw_midi.copy()
+            idx = 0
+            while idx < n_frames:
+                if not voiced_bridged[idx]:
+                    end_idx = idx
+                    while end_idx < n_frames and not voiced_bridged[end_idx]:
+                        end_idx += 1
+                    gap_len = end_idx - idx
+                    if idx >= 2 and end_idx + 2 <= n_frames and gap_len <= 12:
+                        before = slice(idx - 2, idx)
+                        after = slice(end_idx, end_idx + 2)
+                        p_prev = float(np.median(raw_midi[before]))
+                        p_next = float(np.median(raw_midi[after]))
+                        min_energy = 0.20 * min(
+                            np.median(rms[before]), np.median(rms[after])
+                        )
+                        if (
+                            voiced[before].all()
+                            and voiced[after].all()
+                            and abs(p_next - p_prev) <= 1.0
+                            and np.min(rms[idx:end_idx])
+                            > max(rms_gate * 0.6, min_energy)
+                        ):
+                            voiced_bridged[idx:end_idx] = True
+                            midi_bridged[idx:end_idx] = np.linspace(
+                                p_prev, p_next, gap_len + 2
+                            )[1:-1]
+                    idx = end_idx
                 else:
-                    midi_filt[idx:end_idx] = seg
-                idx = end_idx
+                    idx += 1
+
+            midi_filt = np.zeros(n_frames, dtype=np.float32)
+            idx = 0
+            while idx < n_frames:
+                if voiced_bridged[idx]:
+                    end_idx = idx
+                    while end_idx < n_frames and voiced_bridged[end_idx]:
+                        end_idx += 1
+                    seg = midi_bridged[idx:end_idx]
+                    if len(seg) >= 5:
+                        midi_filt[idx:end_idx] = median_filter(
+                            seg, size=5, mode="nearest"
+                        )
+                    elif len(seg) >= 3:
+                        midi_filt[idx:end_idx] = median_filter(
+                            seg, size=3, mode="nearest"
+                        )
+                    else:
+                        midi_filt[idx:end_idx] = seg
+                    idx = end_idx
+                else:
+                    idx += 1
+
+            raw_notes = guide_pitch_notes(midi_filt, pd_np)
+            lyric_starts = sorted(
+                min(chunk["start"] for chunk in line["chunks"])
+                for line in align_data
+                if line.get("chunks")
+            )
+            chunk_starts = sorted(chunk["start"] for chunk in chunks)
+            notes = clean_guide_notes(
+                raw_notes, mono_16k, target_sr, lyric_starts, chunk_starts
+            )
+
+            mid = MidiFile(ticks_per_beat=480)
+            track = MidiTrack()
+            mid.tracks.append(track)
+            tempo = 500000
+            track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
+            program = 9 if guide_timbre == "glockenspiel" else 11
+            track.append(Message("program_change", program=program, time=0))
+
+            last_tick = 0
+            for t0, t1, pitch in notes:
+                on_tick = round(mido.second2tick(t0, mid.ticks_per_beat, tempo))
+                off_tick = round(mido.second2tick(t1, mid.ticks_per_beat, tempo))
+                track.append(
+                    Message(
+                        "note_on", note=pitch, velocity=100, time=on_tick - last_tick
+                    )
+                )
+                track.append(
+                    Message("note_off", note=pitch, velocity=0, time=off_tick - on_tick)
+                )
+                last_tick = off_tick
+
+            mid.save(str(guide_mid))
+            record_artifacts([guide_mid], kept_mid, mid_fp, manifest, workspace)
+            did_work = True
+
+        wav_inputs = [guide_mid, source_wav]
+        if guide_timbre == "continuous":
+            wav_inputs.append(vocals_wav)
+        wav_fp = compute_fingerprint(
+            wav_inputs, {"stage": "5_wav_v6", "timbre": guide_timbre}
+        )
+        run_wav, kept_wav = check_stage_status([guide_wav], wav_fp, manifest, force)
+        if run_wav:
+            info = sf.info(str(source_wav))
+            if guide_timbre == "continuous":
+                synthesize_continuous_guide(
+                    guide_mid,
+                    vocals_wav,
+                    guide_wav,
+                    info.duration,
+                    sr=info.samplerate,
+                )
             else:
-                idx += 1
+                synthesize_mallet_guide(
+                    guide_mid,
+                    guide_wav,
+                    info.duration,
+                    guide_timbre,
+                    sr=info.samplerate,
+                )
+            record_artifacts([guide_wav], kept_wav, wav_fp, manifest, workspace)
+            did_work = True
 
-        raw_notes = guide_pitch_notes(midi_filt, pd_np)
-
-        notes = []
-        idx = 0
-        while idx < len(raw_notes):
-            if idx + 2 < len(raw_notes):
-                t0_a, t1_a, p_a = raw_notes[idx]
-                t0_b, t1_b, p_b = raw_notes[idx + 1]
-                t0_c, t1_c, p_c = raw_notes[idx + 2]
-                if (
-                    p_a == p_c
-                    and abs(p_b - p_a) == 12
-                    and (t1_b - t0_b) < 0.20
-                    and (t0_b - t1_a) <= 0.05
-                    and (t0_c - t1_b) <= 0.05
-                ):
-                    raw_notes[idx + 2] = (t0_a, t1_c, p_a)
-                    idx += 2
-                    continue
-            notes.append(raw_notes[idx])
-            idx += 1
-
-        lyric_starts = sorted(
-            min(chunk["start"] for chunk in line["chunks"])
-            for line in align_data
-            if line.get("chunks")
+    if need_filtered:
+        filt_fp = compute_fingerprint([vocals_wav], {"stage": "5_filtered_v1"})
+        run_filt, kept_filt = check_stage_status(
+            [filtered_wav], filt_fp, manifest, force
         )
-        if lyric_starts:
-            notes = correct_guide_octaves(notes, mono_16k, target_sr, lyric_starts)
+        if run_filt:
+            synthesize_filtered_vocals(vocals_wav, filtered_wav)
+            record_artifacts([filtered_wav], kept_filt, filt_fp, manifest, workspace)
+            did_work = True
 
-        mid = MidiFile(ticks_per_beat=480)
-        track = MidiTrack()
-        mid.tracks.append(track)
-        tempo = 500000
-        track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
-        program = 9 if guide_timbre == "glockenspiel" else 11
-        track.append(Message("program_change", program=program, time=0))
-
-        last_tick = 0
-        for t0, t1, pitch in notes:
-            on_tick = round(mido.second2tick(t0, mid.ticks_per_beat, tempo))
-            off_tick = round(mido.second2tick(t1, mid.ticks_per_beat, tempo))
-            track.append(
-                Message("note_on", note=pitch, velocity=100, time=on_tick - last_tick)
-            )
-            track.append(
-                Message("note_off", note=pitch, velocity=0, time=off_tick - on_tick)
-            )
-            last_tick = off_tick
-
-        mid.save(str(guide_mid))
-        record_artifacts([guide_mid], kept_mid, mid_fp, manifest, workspace)
-
-    wav_inputs = [guide_mid, source_wav]
-    if guide_timbre == "continuous":
-        wav_inputs.append(vocals_wav)
-    wav_fp = compute_fingerprint(
-        wav_inputs, {"stage": "5_wav_v5", "timbre": guide_timbre}
-    )
-    run_wav, kept_wav = check_stage_status([guide_wav], wav_fp, manifest, force)
-    if not run_wav:
-        return run_mid
-
-    info = sf.info(str(source_wav))
-    if guide_timbre == "continuous":
-        synthesize_continuous_guide(
-            guide_mid,
-            vocals_wav,
-            guide_wav,
-            info.duration,
-            sr=info.samplerate,
-        )
-    else:
-        synthesize_mallet_guide(
-            guide_mid, guide_wav, info.duration, guide_timbre, sr=info.samplerate
-        )
-    record_artifacts([guide_wav], kept_wav, wav_fp, manifest, workspace)
-    return True
+    return did_work
 
 
 def stage6_background(bg_arg: Path | None) -> Path:
@@ -2742,20 +3021,25 @@ def stage7_render(
     vocal_vol: float,
     manifest: dict,
     force: bool,
+    filtered_vocal_vol: float = 0.0,
 ) -> Path:
     source_wav = workspace / "source.wav"
     inst_wav = workspace / "instrumental.wav"
     guide_wav = workspace / "guide.wav"
+    filtered_wav = workspace / "vocals_filtered.wav"
     vocals_wav = workspace / "vocals.wav"
     karaoke_ass = workspace / "karaoke.ass"
     output_mp4 = workspace / f"{song_stem}_karaoke.mp4"
 
     use_guide = guide_vol > 0.0
-    upstream_files = (
-        [inst_wav, guide_wav, vocals_wav, karaoke_ass, bg_path, font_path]
-        if use_guide
-        else [inst_wav, vocals_wav, karaoke_ass, bg_path, font_path]
-    )
+    use_filtered = filtered_vocal_vol > 0.0
+    upstream_files = [inst_wav]
+    if use_guide:
+        upstream_files.append(guide_wav)
+    if use_filtered:
+        upstream_files.append(filtered_wav)
+    upstream_files.extend([vocals_wav, karaoke_ass, bg_path, font_path])
+
     input_fp = compute_fingerprint(
         upstream_files,
         {
@@ -2763,6 +3047,7 @@ def stage7_render(
             "audio_layout": audio_layout,
             "inst_vol": inst_vol,
             "guide_vol": guide_vol,
+            "filtered_vocal_vol": filtered_vocal_vol,
             "vocal_vol": vocal_vol,
         },
     )
@@ -2784,108 +3069,85 @@ def stage7_render(
         f"crop=1920:1080,fps=30,ass={ass_esc}:fontsdir={fontsdir_esc}[vout]"
     )
 
+    audio_stems = [("inst", inst_wav, inst_vol)]
     if use_guide:
-        audio_inputs = [
-            "-i",
-            str(inst_wav),
-            "-i",
-            str(guide_wav),
-            "-i",
-            str(vocals_wav),
+        audio_stems.append(("guide", guide_wav, guide_vol))
+    if use_filtered:
+        audio_stems.append(("filt", filtered_wav, filtered_vocal_vol))
+    audio_stems.append(("voc", vocals_wav, vocal_vol))
+
+    audio_inputs = []
+    for _, wav_path, _ in audio_stems:
+        audio_inputs.extend(["-i", str(wav_path)])
+
+    if audio_layout == "mix":
+        gain_filters = [
+            f"[{idx}:a]volume={gain}[a_{name}]"
+            for idx, (name, _, gain) in enumerate(audio_stems, start=1)
         ]
-        if audio_layout == "mix":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol}[a_inst];"
-                f"[2:a]volume={guide_vol}[a_guide];"
-                f"[3:a]volume={vocal_vol}[a_voc];"
-                f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
-                f"alimiter=limit=0.97[aout]"
+        mix_labels = "".join(f"[a_{name}]" for name, _, _ in audio_stems)
+        filter_complex = (
+            f"{v_filter};"
+            + ";".join(gain_filters)
+            + f";{mix_labels}amix=inputs={len(audio_stems)}:normalize=0,"
+            f"alimiter=limit=0.97[aout]"
+        )
+        map_args = ["-map", "[vout]", "-map", "[aout]"]
+    elif audio_layout == "dual-track":
+        gain_filters = [
+            f"[{idx}:a]volume={gain}[a_{name}]"
+            for idx, (name, _, gain) in enumerate(audio_stems, start=1)
+        ]
+        mix_labels = "".join(f"[a_{name}]" for name, _, _ in audio_stems)
+        filter_complex = (
+            f"{v_filter};"
+            f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
+            + ";".join(gain_filters)
+            + f";{mix_labels}amix=inputs={len(audio_stems)}:normalize=0,"
+            f"alimiter=limit=0.97[a_guide_mix]"
+        )
+        map_args = [
+            "-map",
+            "[vout]",
+            "-map",
+            "[a_off]",
+            "-map",
+            "[a_guide_mix]",
+            "-metadata:s:a:0",
+            "title=Off vocal",
+            "-metadata:s:a:1",
+            "title=Guide",
+            "-disposition:a:0",
+            "default",
+        ]
+    elif audio_layout == "split-lr":
+        left_stems = [
+            (idx, name, gain)
+            for idx, (name, _, gain) in enumerate(audio_stems, start=1)
+            if name != "voc"
+        ]
+        voc_idx = len(audio_stems)
+        left_gains = [
+            f"[{idx}:a]volume={gain}[a_{name}]" for idx, name, gain in left_stems
+        ]
+        if len(left_stems) > 1:
+            left_labels = "".join(f"[a_{name}]" for _, name, _ in left_stems)
+            left_chain = (
+                ";".join(left_gains)
+                + f";{left_labels}amix=inputs={len(left_stems)}:normalize=0,"
+                "pan=mono|c0=0.5*c0+0.5*c1[a_left]"
             )
-            map_args = ["-map", "[vout]", "-map", "[aout]"]
-        elif audio_layout == "dual-track":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
-                f"[1:a]volume={inst_vol}[a_inst];"
-                f"[2:a]volume={guide_vol}[a_guide];"
-                f"[3:a]volume={vocal_vol}[a_voc];"
-                f"[a_inst][a_guide][a_voc]amix=inputs=3:normalize=0,"
-                f"alimiter=limit=0.97[a_guide_mix]"
-            )
-            map_args = [
-                "-map",
-                "[vout]",
-                "-map",
-                "[a_off]",
-                "-map",
-                "[a_guide_mix]",
-                "-metadata:s:a:0",
-                "title=Off vocal",
-                "-metadata:s:a:1",
-                "title=Guide",
-                "-disposition:a:0",
-                "default",
-            ]
-        elif audio_layout == "split-lr":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol}[a_inst];"
-                f"[2:a]volume={guide_vol}[a_guide];"
-                f"[a_inst][a_guide]amix=inputs=2:normalize=0,"
-                f"pan=mono|c0=0.5*c0+0.5*c1[a_left];"
-                f"[3:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
-                f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
-                f"alimiter=limit=0.97[aout]"
-            )
-            map_args = ["-map", "[vout]", "-map", "[aout]"]
         else:
-            raise ValueError(f"Unsupported audio layout: {audio_layout}")
+            left_chain = f"[1:a]volume={inst_vol},pan=mono|c0=0.5*c0+0.5*c1[a_left]"
+        filter_complex = (
+            f"{v_filter};{left_chain};"
+            f"[{voc_idx}:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
+            f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
+            f"alimiter=limit=0.97[aout]"
+        )
+        map_args = ["-map", "[vout]", "-map", "[aout]"]
     else:
-        audio_inputs = ["-i", str(inst_wav), "-i", str(vocals_wav)]
-        if audio_layout == "mix":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol}[a_inst];"
-                f"[2:a]volume={vocal_vol}[a_voc];"
-                f"[a_inst][a_voc]amix=inputs=2:normalize=0,"
-                f"alimiter=limit=0.97[aout]"
-            )
-            map_args = ["-map", "[vout]", "-map", "[aout]"]
-        elif audio_layout == "dual-track":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol},alimiter=limit=0.97[a_off];"
-                f"[1:a]volume={inst_vol}[a_inst];"
-                f"[2:a]volume={vocal_vol}[a_voc];"
-                f"[a_inst][a_voc]amix=inputs=2:normalize=0,"
-                f"alimiter=limit=0.97[a_guide_mix]"
-            )
-            map_args = [
-                "-map",
-                "[vout]",
-                "-map",
-                "[a_off]",
-                "-map",
-                "[a_guide_mix]",
-                "-metadata:s:a:0",
-                "title=Off vocal",
-                "-metadata:s:a:1",
-                "title=Guide",
-                "-disposition:a:0",
-                "default",
-            ]
-        elif audio_layout == "split-lr":
-            filter_complex = (
-                f"{v_filter};"
-                f"[1:a]volume={inst_vol},pan=mono|c0=0.5*c0+0.5*c1[a_left];"
-                f"[2:a]volume={vocal_vol},pan=mono|c0=0.5*c0+0.5*c1[a_right];"
-                f"[a_left][a_right]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,"
-                f"alimiter=limit=0.97[aout]"
-            )
-            map_args = ["-map", "[vout]", "-map", "[aout]"]
-        else:
-            raise ValueError(f"Unsupported audio layout: {audio_layout}")
+        raise ValueError(f"Unsupported audio layout: {audio_layout}")
 
     cmd = [
         "ffmpeg",
@@ -2939,7 +3201,7 @@ def check_forced_edits(workspace: Path, force_idx: int, manifest: dict):
         ["vocals.wav", "instrumental.wav"],
         ["lyrics.txt", "alignment.json"],
         ["lyrics_ruby.txt", "karaoke.ass"],
-        ["guide.mid", "guide.wav"],
+        ["guide.mid", "guide.wav", "vocals_filtered.wav"],
         [],
         [],
     ]
@@ -2987,6 +3249,12 @@ def main():
         type=parse_volume,
         default=0.3,
         help="Guide chime volume level",
+    )
+    parser.add_argument(
+        "--filtered-vocal-vol",
+        type=parse_volume,
+        default=0.0,
+        help="Softened/de-sung filtered vocal guide volume level",
     )
     parser.add_argument(
         "--vocal-vol",
@@ -3044,6 +3312,7 @@ def main():
     for name, val in [
         ("--inst-vol", args.inst_vol),
         ("--guide-vol", args.guide_vol),
+        ("--filtered-vocal-vol", args.filtered_vocal_vol),
         ("--vocal-vol", vocal_vol),
     ]:
         if val > 1.0:
@@ -3123,11 +3392,20 @@ def main():
     )
     run_stage(
         5,
-        "Extracting and synthesizing guide melody",
-        lambda f: stage5_guide(workspace, args.guide_timbre, manifest, f),
+        "Extracting guide melody and filtered vocals",
+        lambda f: stage5_guide(
+            workspace,
+            args.guide_timbre,
+            manifest,
+            f,
+            guide_vol=args.guide_vol,
+            filtered_vocal_vol=args.filtered_vocal_vol,
+        ),
         skip_reason=(
-            "guide muted"
-            if args.guide_vol == 0.0 and force_idx != STAGES.index("guide")
+            "guide and filtered vocals muted"
+            if args.guide_vol == 0.0
+            and args.filtered_vocal_vol == 0.0
+            and force_idx != STAGES.index("guide")
             else None
         ),
     )
@@ -3159,6 +3437,7 @@ def main():
             vocal_vol,
             manifest,
             forced,
+            filtered_vocal_vol=args.filtered_vocal_vol,
         )
         out_holder.append(res_path)
         new_mtime = res_path.stat().st_mtime_ns if res_path.exists() else None
