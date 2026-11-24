@@ -709,7 +709,7 @@ def stage3_align(
         upstream,
         {
             "stage": 3,
-            "version": 5,
+            "version": 7,
             "whisper_model": whisper_model,
             "language": language,
         },
@@ -799,6 +799,32 @@ def stage3_align(
             model, vocals_wav, resolved_lang, clean_lines, out_lines
         )
     if alignment_json not in kept:
+        samples, rate = sf.read(vocals_wav, dtype="float32", always_2d=True)
+        active, step = vocal_activity(samples.mean(axis=1), rate)
+        # A quiet lead-in and sustained attack distinguish phrase entrances
+        # from short consonant gaps inside a word.
+        attacks = [
+            i * step
+            for i in np.flatnonzero(np.diff(active.astype(int), prepend=0) == 1)
+            if not active[max(0, i - 6) : i].any()
+            and len(active[i : i + 4]) == 4
+            and active[i : i + 4].all()
+        ]
+        previous_end = 0.0
+        for line in out_lines:
+            for chunk in line["chunks"]:
+                if previous_end == 0.0 or chunk["start"] - previous_end >= 0.35:
+                    nearby = [
+                        attack
+                        for attack in attacks
+                        if previous_end <= attack < chunk["end"]
+                        and abs(attack - chunk["start"]) <= 0.30
+                    ]
+                    if nearby:
+                        chunk["start"] = min(
+                            nearby, key=lambda attack: abs(attack - chunk["start"])
+                        )
+                previous_end = chunk["end"]
         alignment_json.write_text(
             json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
             encoding="utf-8",
