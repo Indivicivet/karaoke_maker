@@ -2291,6 +2291,186 @@ def synthesize_continuous_guide(
     sf.write(str(out_wav), np.column_stack([buf, buf]), sr, subtype="FLOAT")
 
 
+def synthesize_simple_guide(
+    vocals_wav: Path,
+    out_wav: Path,
+    duration_sec: float,
+    sr: int = 44100,
+):
+    """Synthesize a smooth 2-harmonic synth at the continuous vocal pitch, modulated by vocal RMS."""
+    audio, vocal_sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
+    mono_vocal = audio.mean(axis=1)
+    total_samples = int(round(duration_sec * sr))
+
+    target_sr = 16000
+    if vocal_sr != target_sr:
+        g = math.gcd(vocal_sr, target_sr)
+        mono_16k = resample_poly(mono_vocal, target_sr // g, vocal_sr // g).astype(
+            np.float32
+        )
+    else:
+        mono_16k = mono_vocal
+
+    hop_16k = 160  # 10 ms at 16 kHz
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    crepe_model = "full" if device == "cuda" else "tiny"
+    audio_tensor = torch.from_numpy(mono_16k).unsqueeze(0)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    f0, pd = torchcrepe.predict(
+        audio_tensor,
+        sample_rate=target_sr,
+        hop_length=hop_16k,
+        fmin=45.0,
+        fmax=1100.0,
+        model=crepe_model,
+        decoder=decode_guide_pitch,
+        return_periodicity=True,
+        batch_size=1024 if device == "cuda" else 256,
+        device=device,
+    )
+    f0_np = f0.squeeze(0).cpu().numpy()
+    pd_np = pd.squeeze(0).cpu().numpy()
+    del audio_tensor, f0, pd
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    n_frames = len(f0_np)
+
+    hop_v = max(1, round(vocal_sr * 0.01))
+    win_v = hop_v * 2
+    rms = np.zeros(n_frames, dtype=np.float32)
+    for i in range(n_frames):
+        s = i * hop_v
+        chunk = mono_vocal[s : s + win_v]
+        if len(chunk) > 0:
+            rms[i] = float(np.sqrt(np.mean(chunk * chunk)))
+
+    rms_smooth = gaussian_filter1d(rms, sigma=2.0).astype(np.float32)
+    active_rms = rms_smooth[rms_smooth > 1e-4]
+    ref_rms = float(np.percentile(active_rms, 90)) if len(active_rms) else 1e-6
+    rms_gate = max(
+        float(np.max(rms_smooth)) * 0.015 if len(rms_smooth) else 0.0, ref_rms * 0.025
+    )
+
+    voiced = (rms_smooth > rms_gate) & (pd_np >= 0.16) & (f0_np >= 45.0)
+    valid_pts = np.flatnonzero(voiced)
+    if len(valid_pts) == 0:
+        sf.write(
+            str(out_wav),
+            np.zeros((total_samples, 2), dtype=np.float32),
+            sr,
+            subtype="FLOAT",
+        )
+        return
+
+    midi_raw = 69.0 + 12.0 * np.log2(np.maximum(f0_np, 1e-3) / 440.0)
+    midi_clean = np.full(n_frames, np.nan, dtype=np.float64)
+    midi_clean[voiced] = midi_raw[voiced]
+
+    # Bridge tiny <=80 ms consonant gaps for median filtering without smearing phrase breaks.
+    if len(valid_pts) >= 2:
+        midi_work = midi_clean.copy()
+        for a, b in zip(valid_pts[:-1], valid_pts[1:]):
+            if b - a <= 8:
+                midi_work[a : b + 1] = np.linspace(
+                    midi_clean[a], midi_clean[b], b - a + 1
+                )
+        valid_mask = ~np.isnan(midi_work)
+        i = 0
+        while i < n_frames:
+            if valid_mask[i]:
+                j = i
+                while j < n_frames and valid_mask[j]:
+                    j += 1
+                seg = midi_work[i:j]
+                if len(seg) >= 5:
+                    midi_work[i:j] = median_filter(seg, size=5, mode="nearest")
+                elif len(seg) >= 3:
+                    midi_work[i:j] = median_filter(seg, size=3, mode="nearest")
+                i = j
+            else:
+                i += 1
+        midi_clean[voiced] = midi_work[voiced]
+
+    # Fold brief (<=200 ms) octave/harmonic spikes when surrounding anchors agree.
+    runs = []
+    i = 0
+    while i < n_frames:
+        if voiced[i]:
+            j = i
+            while j < n_frames and voiced[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    for idx_r in range(1, len(runs) - 1):
+        s_a, e_a = runs[idx_r - 1]
+        s_b, e_b = runs[idx_r]
+        s_c, e_c = runs[idx_r + 1]
+        if e_b - s_b <= 20 and s_b - e_a <= 25 and s_c - e_b <= 25:
+            p_a = float(np.median(midi_clean[s_a:e_a]))
+            p_b = float(np.median(midi_clean[s_b:e_b]))
+            p_c = float(np.median(midi_clean[s_c:e_c]))
+            if abs(p_a - p_c) <= 4.0 and abs(p_b - p_a) >= 9.0:
+                ref_p = 0.5 * (p_a + p_c)
+                shift = round((ref_p - p_b) / 12.0) * 12.0
+                if shift != 0.0 and abs((p_b + shift) - ref_p) <= 5.0:
+                    midi_clean[s_b:e_b] += shift
+
+    all_idx = np.arange(n_frames)
+    midi_interp = np.interp(all_idx, valid_pts, midi_clean[valid_pts])
+    midi_smooth = gaussian_filter1d(midi_interp, sigma=1.5)
+    freq_10ms = 440.0 * (2.0 ** ((midi_smooth - 69.0) / 12.0))
+
+    dist_left = np.full(n_frames, n_frames, dtype=np.int32)
+    last_v = -n_frames
+    for i in range(n_frames):
+        if voiced[i]:
+            last_v = i
+        dist_left[i] = i - last_v
+    dist_right = np.full(n_frames, n_frames, dtype=np.int32)
+    next_v = 2 * n_frames
+    for i in range(n_frames - 1, -1, -1):
+        if voiced[i]:
+            next_v = i
+        dist_right[i] = next_v - i
+    nearest_voiced_dist = np.minimum(dist_left, dist_right)
+
+    rms_norm = np.clip(
+        (rms_smooth - rms_gate * 0.5) / max(ref_rms - rms_gate * 0.5, 1e-6), 0.0, 1.0
+    )
+    rms_env = rms_norm**0.62
+    pd_smooth = gaussian_filter1d(pd_np, sigma=2.5)
+    pitch_prox = np.clip(1.0 - (nearest_voiced_dist - 8) / 20.0, 0.25, 1.0)
+    voicing_weight = np.where(
+        voiced,
+        1.0,
+        np.clip(0.35 + 0.65 * (pd_smooth / 0.20), 0.35, 1.0) * pitch_prox,
+    )
+    amp_10ms = gaussian_filter1d(rms_env * voicing_weight, sigma=1.5)
+    amp_10ms[rms_smooth <= rms_gate * 0.6] = 0.0
+    amp_10ms = gaussian_filter1d(amp_10ms, sigma=1.0)
+
+    frame_times = (np.arange(n_frames) + 0.5) * 0.01
+    sample_times = np.arange(total_samples, dtype=np.float64) / float(sr)
+    inst_freq = np.interp(sample_times, frame_times, freq_10ms)
+    inst_amp = np.interp(sample_times, frame_times, amp_10ms).astype(np.float32)
+
+    # Accumulate phase in float64 to avoid precision drift over multi-minute songs.
+    phase = np.cumsum(2.0 * np.pi * inst_freq / float(sr), dtype=np.float64)
+    tone = (np.sin(phase) + 0.28 * np.sin(2.0 * phase)).astype(np.float32) * inst_amp
+
+    peak = float(np.max(np.abs(tone), initial=0.0))
+    if peak > 1e-6:
+        tone *= (10.0 ** (-1.0 / 20.0)) / peak
+    sf.write(str(out_wav), np.column_stack([tone, tone]), sr, subtype="FLOAT")
+
+
 def synthesize_filtered_vocals(vocals_wav: Path, out_wav: Path):
     """Create a softened, de-sung shadow vocal directly from vocals.wav without lyrics/Whisper."""
     audio, sr = sf.read(str(vocals_wav), dtype="float32", always_2d=True)
@@ -2664,7 +2844,20 @@ def stage5_guide(
     need_filtered = filtered_vocal_vol > 0.0 or force
     did_work = False
 
-    if need_guide:
+    if need_guide and guide_timbre == "simple":
+        wav_fp = compute_fingerprint(
+            [vocals_wav, source_wav],
+            {"stage": "5_wav_v6", "timbre": guide_timbre},
+        )
+        run_wav, kept_wav = check_stage_status([guide_wav], wav_fp, manifest, force)
+        if run_wav:
+            info = sf.info(str(source_wav))
+            synthesize_simple_guide(
+                vocals_wav, guide_wav, info.duration, sr=info.samplerate
+            )
+            record_artifacts([guide_wav], kept_wav, wav_fp, manifest, workspace)
+            did_work = True
+    elif need_guide:
         mid_fp = compute_fingerprint(
             [vocals_wav, alignment_json],
             {"stage": "5_mid_v7", "timbre": guide_timbre},
@@ -3270,7 +3463,7 @@ def main():
     )
     parser.add_argument(
         "--guide-timbre",
-        choices=["continuous", "vibraphone", "glockenspiel"],
+        choices=["simple", "continuous", "vibraphone", "glockenspiel"],
         default="continuous",
         help="Guide melody synthesis timbre",
     )
