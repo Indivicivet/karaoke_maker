@@ -488,51 +488,393 @@ def alignment_coverage(line):
     ) / len(positions)
 
 
-def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
-    if all(alignment_coverage(line) == 1.0 for line in aligned) and all(
-        previous["chunks"][-1]["end"] <= current["chunks"][0]["start"] + 0.5
-        for previous, current in zip(aligned, aligned[1:])
+def infer_line_language(text: str, default_lang: str) -> str:
+    has_kana = any(0x3040 <= ord(ch) <= 0x30FF for ch in text)
+    has_cjk = any(is_kanji(ch) for ch in text)
+    if has_kana or (has_cjk and default_lang not in {"zh", "yue"}):
+        return "ja"
+    if has_cjk:
+        return default_lang
+    if default_lang in {"ja", "zh", "yue", "ko"} and (
+        len(re.findall(r"[A-Za-z']+", text)) >= 2
+        or re.search(r"[A-Za-z]{4,}", text) is not None
     ):
-        return aligned
+        return "en"
+    return default_lang
 
-    print("  Searching the vocal transcription for poorly timed lyric lines.")
-    transcript = model.transcribe(
-        str(vocals_wav),
-        language=language,
-        vad=False,
-        stream=False,
-        fp16=False,
-    )
+
+def snap_vocal_boundaries(lines, samples, sample_rate):
+    frame_size = max(1, round(sample_rate * 0.02))
+    step = frame_size / sample_rate
+    frames = samples[: len(samples) // frame_size * frame_size].reshape(-1, frame_size)
+    if not len(frames):
+        return lines
+    rms = np.sqrt(np.mean(frames**2, axis=1))
+    peak = float(rms.max())
+    if peak <= 0.0:
+        return lines
+    floor = min(peak * 0.08, float(np.percentile(rms, 10)) * 2.5)
+    active = rms > max(peak * 0.02, floor)
+    onset_floor = max(peak * 0.01, floor * 0.5)
+    duration = len(samples) / sample_rate
+
+    copied = [
+        {"text": line["text"], "chunks": [dict(c) for c in line["chunks"]]}
+        for line in lines
+    ]
+    flat = [
+        (li, ci, chunk)
+        for li, line in enumerate(copied)
+        for ci, chunk in enumerate(line["chunks"])
+    ]
+    if not flat:
+        return copied
+
+    # Trim silence dragged onto the end of a phrase or line before a rest.
+    for idx, (li, ci, chunk) in enumerate(flat):
+        next_start = flat[idx + 1][2]["start"] if idx + 1 < len(flat) else duration
+        is_line_end = ci == len(copied[li]["chunks"]) - 1
+        if not is_line_end and next_start - chunk["end"] < 0.25:
+            continue
+        f0 = max(0, math.floor(chunk["start"] / step))
+        f1 = min(len(active), math.ceil(chunk["end"] / step))
+        voiced = np.flatnonzero(active[f0:f1])
+        if len(voiced):
+            active_end = min(duration, (f0 + int(voiced[-1]) + 1) * step + 0.06)
+            if chunk["end"] - active_end > 0.25 and active_end >= chunk["start"] + 0.08:
+                chunk["end"] = active_end
+
+    # A quiet lead-in, sustained vocal energy, and non-breath peak distinguish true
+    # phrase entrances from intake breaths or brief consonant dips inside a word.
+    attacks = []
+    for i in np.flatnonzero(np.diff(active.astype(int), prepend=0) == 1):
+        if (
+            not active[max(0, i - 6) : i].any()
+            and len(active[i : i + 4]) == 4
+            and active[i : i + 4].all()
+            and float(rms[i : min(len(rms), i + 8)].max()) >= peak * 0.05
+        ):
+            onset = int(i)
+            for _ in range(3):
+                if (
+                    onset > 0
+                    and rms[onset - 1] >= onset_floor
+                    and rms[onset - 1] <= rms[onset]
+                ):
+                    onset -= 1
+                else:
+                    break
+            attacks.append(onset * step)
+
+    previous_end = 0.0
+    for _, _, chunk in flat:
+        if previous_end == 0.0 or chunk["start"] - previous_end >= 0.35:
+            nearby = [
+                attack
+                for attack in attacks
+                if previous_end <= attack <= chunk["end"] - 0.06
+                and abs(attack - chunk["start"]) <= 0.30
+            ]
+            if nearby:
+                chunk["start"] = min(
+                    nearby, key=lambda attack: abs(attack - chunk["start"])
+                )
+        previous_end = chunk["end"]
+
+    return copied
+
+
+def recover_untimed_lines(
+    model,
+    vocals_wav,
+    language,
+    lines,
+    aligned,
+    allow_lang_switch: bool = False,
+):
     import whisper
 
     audio = whisper.load_audio(str(vocals_wav))
-    recovered = list(aligned)
+    audio_dur = len(audio) / 16000.0
+    active, frame_seconds = vocal_activity(audio, 16000)
+
+    def has_vocal_near(start: float, end: float) -> bool:
+        if not len(active):
+            return True
+        probe_end = min(end, start + 0.35)
+        f0 = max(0, math.floor((start - 0.20) / frame_seconds))
+        f1 = min(len(active), math.ceil((probe_end + 0.15) / frame_seconds))
+        return bool(active[f0:f1].any())
+
+    def is_bad_line(item: dict, prev_end: float) -> bool:
+        alnum_count = sum(1 for _ in normalized_characters(item["text"]))
+        if not alnum_count:
+            return False
+        chunks = item["chunks"]
+        if not chunks or alignment_coverage(item) < 1.0:
+            return True
+        if chunks[0]["start"] + 0.5 < prev_end:
+            return True
+        if not has_vocal_near(chunks[0]["start"], chunks[-1]["end"]):
+            return True
+        if alnum_count >= 5 and chunks[-1]["end"] - chunks[0]["start"] < 0.12:
+            return True
+        return False
+
+    def align_window(slice_lines: list[str], w_start: float, w_end: float, lang: str):
+        s0 = max(0, round(w_start * 16000))
+        s1 = min(len(audio), round(w_end * 16000))
+        if s1 - s0 < 1600:
+            return None
+        res = model.align(
+            audio[s0:s1],
+            "\n".join(slice_lines),
+            language=lang,
+            original_split=True,
+            vad=False,
+            q_levels=60,
+            nonspeech_skip=None,
+            fast_mode=True,
+        )
+        if res is None:
+            return None
+        mapped = map_alignment_chunks(slice_lines, res.segments)
+        offset_sec = s0 / 16000.0
+        max_sec = s1 / 16000.0
+        for item in mapped:
+            valid_chunks = []
+            prev_c_end = w_start
+            for chunk in item["chunks"]:
+                cs = max(prev_c_end, chunk["start"] + offset_sec)
+                ce = min(max_sec, chunk["end"] + offset_sec)
+                if cs + 1e-3 < ce:
+                    valid_chunks.append(
+                        {
+                            "first": chunk["first"],
+                            "last": chunk["last"],
+                            "start": cs,
+                            "end": ce,
+                        }
+                    )
+                    prev_c_end = ce
+            item["chunks"] = valid_chunks
+        return mapped
+
+    recovered = [
+        {"text": item["text"], "chunks": [dict(c) for c in item["chunks"]]}
+        for item in aligned
+    ]
+    line_langs = [
+        infer_line_language(line, language) if allow_lang_switch else language
+        for line in lines
+    ]
+
+    # Re-align foreign-script blocks (e.g. English choruses/bridges inside a Japanese
+    # song) using their native tokenizer and cross-attention language token.
+    if allow_lang_switch:
+        idx = 0
+        while idx < len(lines):
+            if line_langs[idx] == language:
+                idx += 1
+                continue
+            block_lang = line_langs[idx]
+            end_idx = idx + 1
+            while end_idx < len(lines) and line_langs[end_idx] == block_lang:
+                end_idx += 1
+            lower = max(
+                (c["end"] for item in recovered[:idx] for c in item["chunks"]),
+                default=0.0,
+            )
+            upper = min(
+                (c["start"] for item in recovered[end_idx:] for c in item["chunks"]),
+                default=audio_dur,
+            )
+            block_items = recovered[idx:end_idx]
+            k = end_idx - idx
+            all_timed = all(item["chunks"] for item in block_items)
+            w_start, w_end = lower, upper
+            if all_timed:
+                cur_s = block_items[0]["chunks"][0]["start"]
+                cur_e = max(c["end"] for item in block_items for c in item["chunks"])
+                if (
+                    lower <= cur_s + 0.25
+                    and cur_e <= upper + 0.25
+                    and has_vocal_near(cur_s, cur_e)
+                ):
+                    w_start = max(lower, cur_s - 0.5)
+                    w_end = min(upper, cur_e + 0.5)
+            if w_end > w_start + 0.15 * k and (
+                all_timed or (w_end - w_start) <= 8.0 * k + 6.0
+            ):
+                cand_block = align_window(
+                    lines[idx:end_idx], w_start, w_end, block_lang
+                )
+                if cand_block is not None:
+                    old_cov = sum(alignment_coverage(it) for it in block_items) / k
+                    new_cov = sum(alignment_coverage(it) for it in cand_block) / k
+                    if new_cov >= old_cov and (
+                        not all_timed or all(it["chunks"] for it in cand_block)
+                    ):
+                        recovered[idx:end_idx] = cand_block
+                        print(
+                            f"  Aligned lines {idx + 1}-{end_idx} as '{block_lang}' "
+                            f"({w_start:.1f}-{w_end:.1f}s)."
+                        )
+            idx = end_idx
+
+    def any_needs_recovery() -> bool:
+        prev_e = 0.0
+        for item in recovered:
+            if is_bad_line(item, prev_e):
+                return True
+            if item["chunks"]:
+                prev_e = max(prev_e, item["chunks"][-1]["end"])
+        return False
+
+    if not any_needs_recovery():
+        return recovered
+
+    # First try bounded neighbor windows for poorly timed blocks before falling back
+    # to full-song transcription text matching.
+    idx = 0
+    while idx < len(lines):
+        prev_end = max(
+            (c["end"] for item in recovered[:idx] for c in item["chunks"]),
+            default=0.0,
+        )
+        if not is_bad_line(recovered[idx], prev_end):
+            idx += 1
+            continue
+        block_lang = line_langs[idx]
+        end_idx = idx + 1
+        probe_prev = (
+            max(prev_end, recovered[idx]["chunks"][-1]["end"])
+            if recovered[idx]["chunks"]
+            else prev_end
+        )
+        while (
+            end_idx < len(lines)
+            and line_langs[end_idx] == block_lang
+            and is_bad_line(recovered[end_idx], probe_prev)
+        ):
+            if recovered[end_idx]["chunks"]:
+                probe_prev = max(probe_prev, recovered[end_idx]["chunks"][-1]["end"])
+            end_idx += 1
+
+        next_anchor = None
+        for g in range(end_idx, len(lines)):
+            g_chunks = recovered[g]["chunks"]
+            if (
+                g_chunks
+                and alignment_coverage(recovered[g]) == 1.0
+                and g_chunks[0]["start"] > prev_end + 0.1
+                and has_vocal_near(g_chunks[0]["start"], g_chunks[-1]["end"])
+            ):
+                next_anchor = g_chunks[0]["start"]
+                break
+        upper = next_anchor if next_anchor is not None else audio_dur
+        k = end_idx - idx
+        bounded = (
+            idx > 0 and next_anchor is not None and (upper - prev_end) <= 8.0 * k + 6.0
+        ) or ((upper - prev_end) <= 5.0 * k + 2.0)
+        if upper > prev_end + 0.15 * k and bounded:
+            cand_block = align_window(lines[idx:end_idx], prev_end, upper, block_lang)
+            if cand_block is not None:
+                cur_prev = prev_end
+                for offset, cand in enumerate(cand_block, start=idx):
+                    old_item = recovered[offset]
+                    if cand["chunks"] and cand["chunks"][0]["start"] >= cur_prev - 1e-3:
+                        if alignment_coverage(cand) > alignment_coverage(old_item) or (
+                            alignment_coverage(cand) >= alignment_coverage(old_item)
+                            and not is_bad_line(cand, cur_prev)
+                        ):
+                            recovered[offset] = cand
+                            print(
+                                f"  Re-aligned lyric line {offset + 1} in bounded "
+                                f"window {prev_end:.1f}-{upper:.1f}s."
+                            )
+                    if recovered[offset]["chunks"]:
+                        cur_prev = max(cur_prev, recovered[offset]["chunks"][-1]["end"])
+        idx = end_idx
+
+    def needs_transcript_search(
+        item: dict, prev_end: float, upper_bound: float
+    ) -> bool:
+        if upper_bound - prev_end <= 6.0:
+            return False
+        alnum_count = sum(1 for _ in normalized_characters(item["text"]))
+        if not alnum_count:
+            return False
+        chunks = item["chunks"]
+        if not chunks or alignment_coverage(item) < 0.65:
+            return True
+        if chunks[0]["start"] + 0.5 < prev_end:
+            return True
+        return not has_vocal_near(chunks[0]["start"], chunks[-1]["end"])
+
+    transcript_slices = {}
+    announced_search = False
     for index, line in enumerate(lines):
         previous_end = max(
             (chunk["end"] for item in recovered[:index] for chunk in item["chunks"]),
             default=0.0,
         )
-        if (
-            recovered[index]["chunks"]
-            and alignment_coverage(recovered[index]) == 1.0
-            and recovered[index]["chunks"][0]["start"] + 0.5 >= previous_end
-        ):
+        upper_bound = audio_dur
+        for g in range(index + 1, len(lines)):
+            g_chunks = recovered[g]["chunks"]
+            if (
+                g_chunks
+                and alignment_coverage(recovered[g]) == 1.0
+                and g_chunks[0]["start"] > previous_end + 0.1
+                and has_vocal_near(g_chunks[0]["start"], g_chunks[-1]["end"])
+            ):
+                upper_bound = g_chunks[0]["start"]
+                break
+
+        if not needs_transcript_search(recovered[index], previous_end, upper_bound):
             continue
         expected = "".join(char for char, _ in normalized_characters(line))
         if not expected:
             continue
+        if not announced_search:
+            print("  Searching vocal transcription windows for unlocated lyric lines.")
+            announced_search = True
+
+        line_lang = line_langs[index]
+        gap_s = max(0.0, previous_end - 0.5)
+        gap_e = min(audio_dur, upper_bound + 1.5)
+        cache_key = (line_lang, round(gap_s, 1), round(gap_e, 1))
+        if cache_key not in transcript_slices:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            sub_audio = audio[round(gap_s * 16000) : round(gap_e * 16000)]
+            sub_res = model.transcribe(
+                sub_audio,
+                language=line_lang,
+                vad=False,
+                stream=False,
+                fp16=False,
+                temperature=0.0,
+                condition_on_previous_text=False,
+            )
+            transcript_slices[cache_key] = [
+                (seg.start + gap_s, seg.end + gap_s, seg.text)
+                for seg in sub_res.segments
+            ]
+        seg_list = transcript_slices[cache_key]
+
         candidates = []
-        for position, segment in enumerate(transcript.segments):
-            if segment.end <= previous_end:
+        for position, (seg_s, seg_e, seg_text) in enumerate(seg_list):
+            if seg_e <= previous_end or seg_s >= upper_bound + 1.0:
                 continue
-            heard = segment.text
-            end_segment = segment
-            for following in transcript.segments[position : position + 2]:
-                if following is not segment:
-                    if following.start - segment.end > 4:
+            heard = seg_text
+            end_s = seg_e
+            for next_s, next_e, next_text in seg_list[position : position + 2]:
+                if (next_s, next_e, next_text) != (seg_s, seg_e, seg_text):
+                    if next_s - seg_e > 4 or next_s >= upper_bound + 1.0:
                         break
-                    heard += following.text
-                    end_segment = following
+                    heard += next_text
+                    end_s = next_e
                 normalized = "".join(char for char, _ in normalized_characters(heard))
                 match = difflib.SequenceMatcher(
                     None, expected, normalized, autojunk=False
@@ -541,7 +883,7 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
                     expected
                 )
                 if score >= 0.65:
-                    candidates.append((score, segment.start, end_segment.end))
+                    candidates.append((score, seg_s, end_s))
         candidates.sort(key=lambda item: item[0], reverse=True)
         if recovered[index]["chunks"]:
             original_start = recovered[index]["chunks"][0]["start"]
@@ -587,32 +929,87 @@ def recover_untimed_lines(model, vocals_wav, language, lines, aligned):
             )
             continue
         start = max(previous_end, candidates[0][1] - 1.0)
-        end = min(len(audio) / 16000, candidates[0][2] + 1.0)
-        result = model.align(
-            audio[round(start * 16000) : round(end * 16000)],
-            line,
-            language=language,
-            original_split=True,
-            vad=False,
-            nonspeech_skip=None,
-        )
-        if result is None:
+        end = min(upper_bound, candidates[0][2] + 1.0)
+        if end <= start + 0.1:
+            end = min(audio_dur, candidates[0][2] + 1.0)
+        cand_list = align_window([line], start, end, line_lang)
+        if not cand_list:
             continue
-        candidate = map_alignment_chunks([line], result.segments)[0]
-        for chunk in candidate["chunks"]:
-            chunk["start"] += start
-            chunk["end"] += start
-        if (
-            candidate["chunks"]
-            and alignment_coverage(candidate) > alignment_coverage(recovered[index])
+        candidate = cand_list[0]
+        if candidate["chunks"] and (
+            alignment_coverage(candidate) > alignment_coverage(recovered[index])
             or (
-                candidate["chunks"]
-                and recovered[index]["chunks"]
-                and recovered[index]["chunks"][0]["start"] + 0.5 < previous_end
+                alignment_coverage(candidate) >= alignment_coverage(recovered[index])
+                and is_bad_line(recovered[index], previous_end)
+                and not is_bad_line(candidate, previous_end)
             )
         ):
             recovered[index] = candidate
             print(f"  Re-aligned lyric line {index + 1} at {start:.1f}s.")
+
+    # Ensure no lyric line with sung characters is left completely empty and dropped
+    # from karaoke.ass when a valid time gap exists between neighboring timed lines.
+    idx = 0
+    while idx < len(recovered):
+        positions = [pos for _, pos in normalized_characters(recovered[idx]["text"])]
+        if recovered[idx]["chunks"] or not positions:
+            idx += 1
+            continue
+        end_idx = idx + 1
+        while (
+            end_idx < len(recovered)
+            and not recovered[end_idx]["chunks"]
+            and any(normalized_characters(recovered[end_idx]["text"]))
+        ):
+            end_idx += 1
+        lower = max(
+            (c["end"] for item in recovered[:idx] for c in item["chunks"]),
+            default=0.0,
+        )
+        upper = min(
+            (c["start"] for item in recovered[end_idx:] for c in item["chunks"]),
+            default=audio_dur,
+        )
+        count = end_idx - idx
+        if upper > lower + 0.05 * count:
+            t0, t1 = lower, upper
+            if len(active):
+                f0 = max(0, math.floor(lower / frame_seconds))
+                f1 = min(len(active), math.ceil(upper / frame_seconds))
+                voiced = np.flatnonzero(active[f0:f1])
+                if len(voiced):
+                    v0 = max(lower, (f0 + int(voiced[0])) * frame_seconds)
+                    v1 = min(upper, (f0 + int(voiced[-1]) + 1) * frame_seconds)
+                    if v1 - v0 >= 0.12 * count:
+                        t0, t1 = v0, v1
+            char_spans = [
+                [pos for _, pos in normalized_characters(recovered[i]["text"])]
+                for i in range(idx, end_idx)
+            ]
+            weights = [max(1, len(sp)) for sp in char_spans]
+            total_w = sum(weights)
+            cursor = t0
+            for offset, (sp, w) in enumerate(zip(char_spans, weights), start=idx):
+                dur = (t1 - t0) * w / total_w
+                recovered[offset] = {
+                    "text": recovered[offset]["text"],
+                    "chunks": [
+                        {
+                            "first": sp[0],
+                            "last": sp[-1],
+                            "start": cursor,
+                            "end": cursor + dur,
+                        }
+                    ],
+                }
+                cursor += dur
+                print(
+                    f"  Interpolated fallback timing for lyric line {offset + 1} "
+                    f"({recovered[offset]['chunks'][0]['start']:.2f}-"
+                    f"{recovered[offset]['chunks'][0]['end']:.2f}s)."
+                )
+        idx = end_idx
+
     return recovered
 
 
@@ -624,7 +1021,9 @@ def vocal_activity(samples, sample_rate):
         return np.empty(0, dtype=bool), frame_seconds
     rms = np.sqrt(np.mean(frames**2, axis=1))
     peak = float(rms.max())
-    floor = min(peak * 0.10, float(np.percentile(rms, 20)) * 3)
+    # Dense vocal tracks can have singing across >80% of frames, so use p10 rather
+    # than p20 to estimate background noise without mistaking quiet verses for silence.
+    floor = min(peak * 0.08, float(np.percentile(rms, 10)) * 2.5)
     return rms > max(peak * 0.02, floor), frame_seconds
 
 
@@ -709,7 +1108,7 @@ def stage3_align(
         upstream,
         {
             "stage": 3,
-            "version": 7,
+            "version": 8,
             "whisper_model": whisper_model,
             "language": language,
         },
@@ -744,12 +1143,9 @@ def stage3_align(
         whisper_model, device=device, download_root=str(whisper_cache)
     )
 
-    resolved_lang = (
+    explicit_lang = (
         language.lower() if (language and language.lower() != "auto") else None
     )
-
-    if resolved_lang is None:
-        resolved_lang = detect_audio_language(model, vocals_wav)
 
     if has_user_lyrics:
         raw_lines = [
@@ -763,21 +1159,53 @@ def stage3_align(
         if not any(char.isalnum() for char in joined_text):
             raise ValueError("The supplied lyrics file contains no lyric text.")
 
+        if explicit_lang is not None:
+            resolved_lang = explicit_lang
+        elif any(0x3040 <= ord(ch) <= 0x30FF for line in clean_lines for ch in line):
+            resolved_lang = "ja"
+            print("  Detected Japanese script in lyrics; aligning primarily as 'ja'.")
+        else:
+            resolved_lang = detect_audio_language(model, vocals_wav)
+            if resolved_lang in {"ja", "zh", "yue", "ko"} and not any(
+                ord(ch) > 0x024F and ch.isalpha() for line in clean_lines for ch in line
+            ):
+                print(
+                    f"  Lyrics use Latin script; overriding audio language "
+                    f"'{resolved_lang}' with 'en'."
+                )
+                resolved_lang = "en"
+
+        # Speech VAD misclassifies sustained, belted, or screamed vocals as silence;
+        # default q_levels=20 clips soft singing (~-27 dB), and default word_dur_factor=2.0
+        # treats held sung notes (>2x median word length) as misalignments.
         result = model.align(
             str(vocals_wav),
             joined_text,
             language=resolved_lang,
             original_split=True,
-            vad=True,
+            vad=False,
+            q_levels=60,
+            word_dur_factor=3.5,
+            max_word_dur=4.5,
         )
         if result is None:
             raise ValueError(
                 "Whisper could not align the supplied lyrics to vocals.wav."
             )
     else:
-        transcribe_kwargs = {"language": resolved_lang, "stream": False}
+        resolved_lang = (
+            explicit_lang
+            if explicit_lang is not None
+            else detect_audio_language(model, vocals_wav)
+        )
+        transcribe_kwargs = {
+            "language": resolved_lang,
+            "stream": False,
+            "condition_on_previous_text": False,
+        }
         if device == "cuda" and total_vram_gb < 6.0:
             transcribe_kwargs["fp16"] = False
+            transcribe_kwargs["temperature"] = 0.0
         # A speech VAD can classify sung phrases as silence even in an isolated stem.
         result = model.transcribe(str(vocals_wav), vad=False, **transcribe_kwargs)
         if not result.segments:
@@ -793,38 +1221,22 @@ def stage3_align(
         if lyrics_txt not in kept:
             lyrics_txt.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
 
-    out_lines = map_alignment_chunks(clean_lines, result.segments)
+    samples, rate = sf.read(vocals_wav, dtype="float32", always_2d=True)
+    mono_vocals = samples.mean(axis=1)
+    out_lines = snap_vocal_boundaries(
+        map_alignment_chunks(clean_lines, result.segments), mono_vocals, rate
+    )
     if has_user_lyrics:
         out_lines = recover_untimed_lines(
-            model, vocals_wav, resolved_lang, clean_lines, out_lines
+            model,
+            vocals_wav,
+            resolved_lang,
+            clean_lines,
+            out_lines,
+            allow_lang_switch=(explicit_lang is None),
         )
+        out_lines = snap_vocal_boundaries(out_lines, mono_vocals, rate)
     if alignment_json not in kept:
-        samples, rate = sf.read(vocals_wav, dtype="float32", always_2d=True)
-        active, step = vocal_activity(samples.mean(axis=1), rate)
-        # A quiet lead-in and sustained attack distinguish phrase entrances
-        # from short consonant gaps inside a word.
-        attacks = [
-            i * step
-            for i in np.flatnonzero(np.diff(active.astype(int), prepend=0) == 1)
-            if not active[max(0, i - 6) : i].any()
-            and len(active[i : i + 4]) == 4
-            and active[i : i + 4].all()
-        ]
-        previous_end = 0.0
-        for line in out_lines:
-            for chunk in line["chunks"]:
-                if previous_end == 0.0 or chunk["start"] - previous_end >= 0.35:
-                    nearby = [
-                        attack
-                        for attack in attacks
-                        if previous_end <= attack < chunk["end"]
-                        and abs(attack - chunk["start"]) <= 0.30
-                    ]
-                    if nearby:
-                        chunk["start"] = min(
-                            nearby, key=lambda attack: abs(attack - chunk["start"])
-                        )
-                previous_end = chunk["end"]
         alignment_json.write_text(
             json.dumps({"lines": out_lines}, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1114,13 +1526,34 @@ def compute_char_timings(
             times[index] = (cursor, cursor + duration)
             cursor += duration
 
+    if not chunks:
+        return [(0.0, 0.0)] * n
+
+    # Share adjacent chunk intervals when leading, trailing, or zero-gap middle
+    # words lacked distinct timestamps, avoiding 1 ms visual flashes.
+    spans = [[c["first"], c["last"] + 1, c["start"], c["end"]] for c in chunks]
+    if sum(char_mora_weights[0 : spans[0][0]]) > 0:
+        spans[0][0] = 0
+    if sum(char_mora_weights[spans[-1][1] : n]) > 0:
+        spans[-1][1] = n
+
+    merged_spans = [spans[0]]
+    for sp in spans[1:]:
+        prev = merged_spans[-1]
+        gap_weight = sum(char_mora_weights[prev[1] : sp[0]])
+        if gap_weight > 0 and sp[2] - prev[3] < 0.02:
+            prev[1] = sp[1]
+            prev[3] = sp[3]
+        else:
+            merged_spans.append(sp)
+
     next_char = 0
-    previous_end = chunks[0]["start"] if chunks else 0.0
-    for chunk in chunks:
-        distribute(next_char, chunk["first"], previous_end, chunk["start"])
-        next_char = chunk["last"] + 1
-        distribute(chunk["first"], next_char, chunk["start"], chunk["end"])
-        previous_end = chunk["end"]
+    previous_end = merged_spans[0][2]
+    for first_c, stop_c, start_t, end_t in merged_spans:
+        distribute(next_char, first_c, previous_end, start_t)
+        next_char = stop_c
+        distribute(first_c, next_char, start_t, end_t)
+        previous_end = end_t
     distribute(next_char, n, previous_end, previous_end)
     return times
 
@@ -1257,7 +1690,7 @@ def stage4_ass(
 
     ass_input_fp = compute_fingerprint(
         [lyrics_ruby_txt, alignment_json, workspace / "vocals.wav", font_path],
-        {"stage": "4_ass", "version": 2, "style": style_preset},
+        {"stage": "4_ass", "version": 3, "style": style_preset},
     )
     run_ass, kept_ass = check_stage_status([karaoke_ass], ass_input_fp, manifest, force)
     if not run_ass:
@@ -1322,9 +1755,44 @@ Style: LeadInDot,{metrics.family_name},64,{sung_fill},{sung_fill},{sung_out},{sh
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
+    audio_dur = len(samples) / sample_rate
+    effective_chunks = [list(alignment["chunks"]) for alignment in align_data]
+    idx = 0
+    while idx < len(effective_chunks):
+        if effective_chunks[idx] or not display_lines[idx][0].strip():
+            idx += 1
+            continue
+        end_idx = idx + 1
+        while (
+            end_idx < len(effective_chunks)
+            and not effective_chunks[end_idx]
+            and display_lines[end_idx][0].strip()
+        ):
+            end_idx += 1
+        lower = max(
+            (c["end"] for chs in effective_chunks[:idx] for c in chs), default=0.0
+        )
+        upper = min(
+            (c["start"] for chs in effective_chunks[end_idx:] for c in chs),
+            default=audio_dur,
+        )
+        count = end_idx - idx
+        if upper > lower + 0.02 * count:
+            step_dur = (upper - lower) / count
+            for offset in range(idx, end_idx):
+                plain_line = display_lines[offset][0]
+                effective_chunks[offset] = [
+                    {
+                        "first": 0,
+                        "last": len(plain_line) - 1,
+                        "start": lower + (offset - idx) * step_dur,
+                        "end": lower + (offset - idx + 1) * step_dur,
+                    }
+                ]
+        idx = end_idx
+
     parsed_lines = []
-    for (plain_text, segments), alignment in zip(display_lines, align_data):
-        chunks = alignment["chunks"]
+    for (plain_text, segments), chunks in zip(display_lines, effective_chunks):
         if not chunks:
             continue
         char_times = compute_char_timings(plain_text, segments, chunks)
